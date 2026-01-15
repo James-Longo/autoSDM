@@ -134,6 +134,15 @@ format_data <- function(data, coords, year, presence = NULL, nuisance_vars = NUL
         message(sprintf("Removed %d rows with missing values.", rows_before - rows_after))
     }
 
+    # 11. Remove duplicate rows
+    rows_before <- nrow(result)
+    result <- unique(result)
+    rows_after <- nrow(result)
+
+    if (rows_before != rows_after) {
+        message(sprintf("Removed %d duplicate rows.", rows_before - rows_after))
+    }
+
     # List final columns
     cols_desc <- paste(names(result), collapse = ", ")
     message(sprintf("Data formatted: %d rows, %d columns (%s)", nrow(result), ncol(result), cols_desc))
