@@ -72,6 +72,9 @@ class GEEExtractor:
                 try:
                     res = sampled.getInfo()
                     found_any = False
+                    num_features = len(res.get('features', []))
+                    sys.stderr.write(f"DEBUG extractor: Got {num_features} features from GEE for year {int(yr)} chunk {i//CHUNK_SIZE}\n")
+                    
                     for feat in res['features']:
                         props = feat['properties']
                         if 'A00' in props:
@@ -79,16 +82,40 @@ class GEEExtractor:
                             for k, v in props.items():
                                 yr_df.at[idx, k] = v
                             found_any = True
+                        else:
+                            # Debug: Show what properties we did get
+                            if not found_any:
+                                sys.stderr.write(f"DEBUG extractor: Feature has no A00. Keys: {list(props.keys())[:10]}\n")
                     
-                    if not found_any and i == 0:
-                        sys.stderr.write(f"Warning: No valid embeddings found for {int(yr)}\n")
+                    if not found_any:
+                        sys.stderr.write(f"Warning: No valid embeddings found for {int(yr)} chunk {i//CHUNK_SIZE}\n")
+                    else:
+                        # Verify columns were added
+                        if 'A00' in yr_df.columns:
+                            non_na = yr_df['A00'].notna().sum()
+                            sys.stderr.write(f"DEBUG extractor: After processing, A00 has {non_na} non-NA values\n")
                         
                 except Exception as e:
                     sys.stderr.write(f"Error during GEE sampling for {int(yr)} chunk {i//CHUNK_SIZE}: {str(e)}\n")
+            
+            # Debug: Check yr_df before appending
+            if 'A00' in yr_df.columns:
+                non_na = yr_df['A00'].notna().sum()
+                sys.stderr.write(f"DEBUG extractor: Year {int(yr)} complete. A00 has {non_na}/{len(yr_df)} non-NA values\n")
+            else:
+                sys.stderr.write(f"DEBUG extractor: Year {int(yr)} complete. A00 column NOT present!\n")
             
             all_results.append(yr_df)
             
         if not all_results:
             return pd.DataFrame()
+        
+        result = pd.concat(all_results)
+        # Final debug
+        if 'A00' in result.columns:
+            non_na = result['A00'].notna().sum()
+            sys.stderr.write(f"DEBUG extractor: Final result has {non_na}/{len(result)} non-NA A00 values\n")
+        else:
+            sys.stderr.write(f"DEBUG extractor: Final result has NO A00 column!\n")
             
-        return pd.concat(all_results)
+        return result
