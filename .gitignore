@@ -1,0 +1,40 @@
+# R
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.Rcheck/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+venv39/
+*.egg-info/
+dist/
+build/
+
+# Project Outputs & Data
+outputs/
+benchmarks/
+test_simplified_results/
+*results*.json
+*.tif
+*.aux.xml
+
+# Large Data / Intermediate Files
+*.csv
+!ref_data/*.csv
+# (If there are specific CSVs that SHOULD be tracked, uncommment the line above or add them)
+
+# Temporary/Test scripts
+test_simplified.R
+analyze_1000m_test.csv.json
+extrapolate_outputs_1000m.json
+interpolate_outputs_1000m.json
+interpolate_outputs_1000m_no_masks.json
+
+# Environment Variables / Secrets
+.env
+.DS_Store

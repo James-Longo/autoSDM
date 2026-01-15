@@ -1,0 +1,14 @@
+Package: autoSDM
+Title: Extract and Analyze Alpha Earth Embeddings for SDM
+Version: 0.1.0
+Authors@R: person("James", "Lastname", email = "james@example.com", role = c("aut", "cre"))
+Description: This package extracts Alpha Earth embeddings from Google Earth Engine for species locations and performs basic similarity analysis.
+License: MIT
+Encoding: UTF-8
+LazyData: true
+Imports: 
+    vroom,
+    ggplot2,
+    jsonlite
+Suggests: 
+    testthat (>= 3.0.0)
