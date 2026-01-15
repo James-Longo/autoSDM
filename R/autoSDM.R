@@ -51,9 +51,16 @@ autoSDM <- function(data, aoi, output_dir = getwd(), nuisance_vars = NULL, scale
   message(sprintf("Using Python: %s", python_path))
 
   message("Checking Google Earth Engine authentication...")
-  auth_check <- system2(python_path, args = c("-c", "import ee; try: ee.Initialize(); print('OK')\nexcept: exit(1)"), stdout = TRUE, stderr = NULL)
+  # Use semicolons instead of newlines for Windows compatibility
+  gee_check_script <- "import ee; ee.Initialize(); print('OK')"
+  auth_check <- tryCatch(
+    {
+      system2(python_path, args = c("-c", shQuote(gee_check_script)), stdout = TRUE, stderr = TRUE)
+    },
+    error = function(e) ""
+  )
 
-  if (length(auth_check) == 0 || auth_check != "OK") {
+  if (length(auth_check) == 0 || !any(auth_check == "OK")) {
     stop("Google Earth Engine is not initialized or authenticated in the Python environment.\nPlease run 'earthengine authenticate' in your terminal or ensure your credentials are set.")
   }
 
