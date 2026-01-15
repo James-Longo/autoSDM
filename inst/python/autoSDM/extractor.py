@@ -47,9 +47,25 @@ class GEEExtractor:
             yr_df = df[df['Year'] == yr].copy()
             sys.stderr.write(f"Processing {len(yr_df)} points for year {int(yr)} at scale {scale}m...\n")
             
+            # Debug: Print first coordinate
+            if not yr_df.empty:
+                first_lon = yr_df.iloc[0]['Longitude']
+                first_lat = yr_df.iloc[0]['Latitude']
+                sys.stderr.write(f"DEBUG extractor: First coordinate: ({first_lat}, {first_lon})\n")
+            
             img = ee.ImageCollection(asset_path)\
                 .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))\
                 .mosaic()
+            
+            # Debug: Check image band names and projection
+            if yr == years[0]:  # Only for first year
+                try:
+                    bands = img.bandNames().getInfo()
+                    sys.stderr.write(f"DEBUG extractor: Image has {len(bands)} bands: {bands[:5]}...\n")
+                    proj = img.projection().getInfo()
+                    sys.stderr.write(f"DEBUG extractor: Native projection: {proj.get('crs', 'unknown')}, scale: {proj.get('transform', [None, None, None])[0] if proj.get('transform') else 'unknown'}\n")
+                except Exception as e:
+                    sys.stderr.write(f"DEBUG extractor: Could not get image info: {e}\n")
             
             CHUNK_SIZE = 4000
             features = []
@@ -57,6 +73,7 @@ class GEEExtractor:
                 geom = ee.Geometry.Point([row['Longitude'], row['Latitude']])
                 feat = ee.Feature(geom, {'orig_index': str(idx)})
                 features.append(feat)
+
             
             for i in range(0, len(features), CHUNK_SIZE):
                 chunk = features[i:i + CHUNK_SIZE]
