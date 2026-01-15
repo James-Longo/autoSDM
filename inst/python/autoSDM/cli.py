@@ -1,3 +1,7 @@
+# Suppress Google API Python version warnings
+import warnings
+warnings.filterwarnings("ignore", message=".*Python version.*will stop supporting.*", category=FutureWarning)
+
 import argparse
 import pandas as pd
 import os
