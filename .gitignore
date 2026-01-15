@@ -38,3 +38,4 @@ interpolate_outputs_1000m_no_masks.json
 # Environment Variables / Secrets
 .env
 .DS_Store
+sa-key.json
