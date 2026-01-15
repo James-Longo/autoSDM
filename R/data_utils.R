@@ -27,9 +27,16 @@ format_data <- function(data, coords, year, presence = NULL) {
         stop(paste("Coordinate columns not found in data:", paste(missing_cols, collapse = ", ")))
     }
 
-    # Rename to Longitude/Latitude
-    names(data)[names(data) == coords[1]] <- "Longitude"
-    names(data)[names(data) == coords[2]] <- "Latitude"
+    # Rename to Longitude/Latitude securely
+    # Use temporary names to avoid collision if swapping e.g. c("Latitude", "Longitude")
+    idx_lon <- which(names(data) == coords[1])
+    idx_lat <- which(names(data) == coords[2])
+
+    names(data)[idx_lon] <- "TEMP_LONGITUDE_PLACEHOLDER"
+    names(data)[idx_lat] <- "TEMP_LATITUDE_PLACEHOLDER"
+
+    names(data)[names(data) == "TEMP_LONGITUDE_PLACEHOLDER"] <- "Longitude"
+    names(data)[names(data) == "TEMP_LATITUDE_PLACEHOLDER"] <- "Latitude"
 
     # 2. Year Standardization
     if (!year %in% names(data)) {
