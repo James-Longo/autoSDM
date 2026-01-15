@@ -121,13 +121,16 @@ autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, python_path = N
   } else if (is.character(aoi)) {
     # Path to polygon file
     args <- c(args, "--aoi-path", shQuote(aoi))
-  } else if (inherits(aoi, c("sf", "sfc"))) {
-    # sf geometry object - write to temp GeoJSON
+  } else if (inherits(aoi, c("sf", "sfc", "SpatVector"))) {
+    # Geometry object - convert to sf if SpatVector, then write to temp GeoJSON
+    if (inherits(aoi, "SpatVector")) {
+      aoi <- sf::st_as_sf(aoi)
+    }
     aoi_path <- file.path(output_dir, "aoi_temp.geojson")
     sf::st_write(sf::st_transform(aoi, 4326), aoi_path, driver = "GeoJSON", delete_dsn = TRUE, quiet = TRUE)
     args <- c(args, "--aoi-path", shQuote(aoi_path))
   } else {
-    stop("AOI must be a list(lat, lon, radius), a path to a polygon file, or an sf geometry object.")
+    stop("AOI must be a list(lat, lon, radius), a path to a polygon file, or a geometry object (sf or terra).")
   }
 
   # Run the models to save the meta files permanently in output_dir
