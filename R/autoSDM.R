@@ -108,8 +108,8 @@ autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, python_path = N
     "-m", "autoSDM.cli", "ensemble",
     "--input", shQuote(extract_csv),
     "--output", shQuote(ensemble_results_json),
-    "--meta", shQuote(paste0(centroid_meta, ".json")),
-    "--meta2", shQuote(paste0(maxent_meta, ".json")),
+    "--meta", shQuote(sub("\\.csv$", ".json", centroid_meta)),
+    "--meta2", shQuote(sub("\\.csv$", ".json", maxent_meta)),
     "--scale", scale,
     "--prefix", "autoSDM_ensemble"
   )

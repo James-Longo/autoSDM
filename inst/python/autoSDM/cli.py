@@ -103,7 +103,11 @@ def main():
                 "thresholds": thresholds
             }
 
-        meta_path = args.output + ".json"
+        if args.output.endswith('.csv'):
+            meta_path = args.output.replace('.csv', '.json')
+        else:
+            meta_path = args.output + ".json"
+            
         with open(meta_path, 'w') as f:
             json.dump(meta, f)
         sys.stderr.write(f"Analysis complete. Results saved to {args.output} and {meta_path}\n")

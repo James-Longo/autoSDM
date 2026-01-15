@@ -42,7 +42,8 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, py
   df_clean <- read.csv(tmp_out)
 
   # Load metadata
-  meta_path <- paste0(tmp_out, ".json")
+  meta_path <- sub("\\.csv$", ".json", tmp_out)
+  if (!file.exists(meta_path)) meta_path <- paste0(tmp_out, ".json") # Fallback
   meta <- jsonlite::fromJSON(meta_path)
 
   # Clean up
