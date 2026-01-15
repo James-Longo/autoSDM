@@ -6,7 +6,7 @@
 #' presence column to 'present?'.
 #'
 #' @param data A data frame containing your survey data.
-#' @param coords A character vector of length 2 specifying the longitude and latitude columns (e.g., c("lon", "lat")).
+#' @param coords A character vector of length 2 specifying the longitude and latitude columns IN ORDER: c(longitude_col, latitude_col). Note: Longitude first, then Latitude!
 #' @param year A character string specifying the year or date column.
 #' @param presence Optional. A character string specifying the presence/absence column (values should be 0 or 1).
 #' @return A standardized data frame ready for `autoSDM()`.
@@ -37,6 +37,24 @@ format_data <- function(data, coords, year, presence = NULL) {
 
     names(data)[names(data) == "TEMP_LONGITUDE_PLACEHOLDER"] <- "Longitude"
     names(data)[names(data) == "TEMP_LATITUDE_PLACEHOLDER"] <- "Latitude"
+
+    # Sanity check: Warn if coordinates appear swapped
+    # Valid Latitude: -90 to 90, Valid Longitude: -180 to 180
+    sample_lat <- data$Latitude[!is.na(data$Latitude)][1]
+    sample_lon <- data$Longitude[!is.na(data$Longitude)][1]
+
+    if (!is.null(sample_lat) && !is.null(sample_lon)) {
+        lat_in_range <- sample_lat >= -90 && sample_lat <= 90
+        lon_in_range <- sample_lon >= -180 && sample_lon <= 180
+
+        # Check if they might be swapped
+        if (!lat_in_range && lon_in_range) {
+            warning(sprintf(
+                "Coordinates may be SWAPPED! Latitude=%s is outside valid range [-90, 90].\n  Did you pass coords in the correct order? It should be: coords = c(longitude_col, latitude_col)\n  Your call: coords = c('%s', '%s')",
+                sample_lat, coords[1], coords[2]
+            ))
+        }
+    }
 
     # 2. Year Standardization
     if (!year %in% names(data)) {
