@@ -28,7 +28,7 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, py
     "--method", method
   )
 
-  if (!is.null(nuisance_vars)) {
+  if (!is.null(nuisance_vars) && length(nuisance_vars) > 0) {
     args <- c(args, "--nuisance-vars", paste(nuisance_vars, collapse = ","))
   }
 
