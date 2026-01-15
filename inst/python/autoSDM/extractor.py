@@ -3,7 +3,6 @@ import json
 import os
 import sys
 import ee
-sys.stderr.write("DEBUG: Loading extractor.py\n")
 
 class GEEExtractor:
     def __init__(self, json_key_path=None):
@@ -47,25 +46,9 @@ class GEEExtractor:
             yr_df = df[df['Year'] == yr].copy()
             sys.stderr.write(f"Processing {len(yr_df)} points for year {int(yr)} at scale {scale}m...\n")
             
-            # Debug: Print first coordinate
-            if not yr_df.empty:
-                first_lon = yr_df.iloc[0]['Longitude']
-                first_lat = yr_df.iloc[0]['Latitude']
-                sys.stderr.write(f"DEBUG extractor: First coordinate: ({first_lat}, {first_lon})\n")
-            
             img = ee.ImageCollection(asset_path)\
                 .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))\
                 .mosaic()
-            
-            # Debug: Check image band names and projection
-            if yr == years[0]:  # Only for first year
-                try:
-                    bands = img.bandNames().getInfo()
-                    sys.stderr.write(f"DEBUG extractor: Image has {len(bands)} bands: {bands[:5]}...\n")
-                    proj = img.projection().getInfo()
-                    sys.stderr.write(f"DEBUG extractor: Native projection: {proj.get('crs', 'unknown')}, scale: {proj.get('transform', [None, None, None])[0] if proj.get('transform') else 'unknown'}\n")
-                except Exception as e:
-                    sys.stderr.write(f"DEBUG extractor: Could not get image info: {e}\n")
             
             CHUNK_SIZE = 4000
             features = []
@@ -73,13 +56,11 @@ class GEEExtractor:
                 geom = ee.Geometry.Point([row['Longitude'], row['Latitude']])
                 feat = ee.Feature(geom, {'orig_index': str(idx)})
                 features.append(feat)
-
             
             for i in range(0, len(features), CHUNK_SIZE):
                 chunk = features[i:i + CHUNK_SIZE]
                 fc = ee.FeatureCollection(chunk)
                 
-                # Use mean reducer for coarser scales to aggregate info
                 sampled = img.reduceRegions(
                     collection=fc,
                     reducer=ee.Reducer.mean(),
@@ -89,58 +70,24 @@ class GEEExtractor:
                 try:
                     res = sampled.getInfo()
                     found_any = False
-                    num_features = len(res.get('features', []))
-                    sys.stderr.write(f"DEBUG extractor: Got {num_features} features from GEE for year {int(yr)} chunk {i//CHUNK_SIZE}\n")
                     
-                    # Debug first feature
-                    if num_features > 0:
-                        first_props = res['features'][0]['properties']
-                        sys.stderr.write(f"DEBUG extractor: First feature keys: {list(first_props.keys())[:15]}\n")
-                        if 'A00' in first_props:
-                            sys.stderr.write(f"DEBUG extractor: First A00 value: {first_props['A00']} (type: {type(first_props['A00']).__name__})\n")
-                    
-                    for feat_idx, feat in enumerate(res['features']):
+                    for feat in res['features']:
                         props = feat['properties']
                         if 'A00' in props and props['A00'] is not None:
                             idx = int(props.pop('orig_index'))
                             for k, v in props.items():
                                 yr_df.at[idx, k] = v
                             found_any = True
-                        else:
-                            # Debug: Show what properties we did get (only first one)
-                            if feat_idx == 0:
-                                a00_val = props.get('A00', 'NOT_PRESENT')
-                                sys.stderr.write(f"DEBUG extractor: Feature 0 has A00={a00_val}. All keys: {list(props.keys())}\n")
                     
                     if not found_any:
                         sys.stderr.write(f"Warning: No valid embeddings found for {int(yr)} chunk {i//CHUNK_SIZE}\n")
-                    else:
-                        # Verify columns were added
-                        if 'A00' in yr_df.columns:
-                            non_na = yr_df['A00'].notna().sum()
-                            sys.stderr.write(f"DEBUG extractor: After processing, A00 has {non_na} non-NA values\n")
                         
                 except Exception as e:
                     sys.stderr.write(f"Error during GEE sampling for {int(yr)} chunk {i//CHUNK_SIZE}: {str(e)}\n")
-            
-            # Debug: Check yr_df before appending
-            if 'A00' in yr_df.columns:
-                non_na = yr_df['A00'].notna().sum()
-                sys.stderr.write(f"DEBUG extractor: Year {int(yr)} complete. A00 has {non_na}/{len(yr_df)} non-NA values\n")
-            else:
-                sys.stderr.write(f"DEBUG extractor: Year {int(yr)} complete. A00 column NOT present!\n")
             
             all_results.append(yr_df)
             
         if not all_results:
             return pd.DataFrame()
         
-        result = pd.concat(all_results)
-        # Final debug
-        if 'A00' in result.columns:
-            non_na = result['A00'].notna().sum()
-            sys.stderr.write(f"DEBUG extractor: Final result has {non_na}/{len(result)} non-NA A00 values\n")
-        else:
-            sys.stderr.write(f"DEBUG extractor: Final result has NO A00 column!\n")
-            
-        return result
+        return pd.concat(all_results)

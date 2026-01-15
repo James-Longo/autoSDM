@@ -28,45 +28,29 @@ def analyze_embeddings(df, class_property='presence'):
     """
     emb_cols = [f"A{i:02d}" for i in range(64)]
     
-    import sys
-    sys.stderr.write(f"DEBUG analyzer.py: DataFrame has {len(df)} rows, {len(df.columns)} columns\n")
-    sys.stderr.write(f"DEBUG analyzer.py: Columns present: {list(df.columns)[:20]}... (showing first 20)\n")
-    
     # Check if all columns exist
     missing = [c for c in emb_cols if c not in df.columns]
     if missing:
-        sys.stderr.write(f"DEBUG analyzer.py: Missing {len(missing)} embedding columns: {missing[:5]}...\n")
         raise ValueError(f"Missing embedding columns: {missing}")
     
-    # Debug: Check NA counts in embedding columns
-    na_counts = df[emb_cols].isna().sum()
-    total_nas = na_counts.sum()
-    sys.stderr.write(f"DEBUG analyzer.py: Total NAs across embedding columns: {total_nas}\n")
-    if total_nas > 0:
-        sys.stderr.write(f"DEBUG analyzer.py: Sample NA counts per column: {dict(list(na_counts.items())[:5])}\n")
-    
-    # 1. Identity class property for presence/absence
+    # Auto-detect presence column with various naming conventions
     if class_property not in df.columns:
-        if 'present?' in df.columns:
-            class_property = 'present?'
-        elif 'presence' in df.columns:
-            class_property = 'presence'
+        for candidate in ['present?', 'presence', 'Present.', 'Present', 'PRESENCE']:
+            if candidate in df.columns:
+                class_property = candidate
+                break
     
     # Drop NAs in embeddings and class property
     cols_to_check = emb_cols
     if class_property in df.columns:
         cols_to_check = emb_cols + [class_property]
     
-    # Check how many rows would survive
-    rows_before = len(df)
     df_clean = df.dropna(subset=cols_to_check).copy()
-    rows_after = len(df_clean)
-    sys.stderr.write(f"DEBUG analyzer.py: Rows before dropna: {rows_before}, after: {rows_after}\n")
     
     if df_clean.empty:
-        raise ValueError(f"No valid data found after dropping NAs. Rows: {len(df)}, Check if embedding extraction succeeded.")
+        raise ValueError(f"No valid data found after dropping NAs. Rows: {len(df)}")
         
-    # 2. Species Centroid (calculated from PRESENCE points only)
+    # Species Centroid (calculated from PRESENCE points only)
     if class_property in df_clean.columns and df_clean[class_property].sum() > 0:
         presence_df = df_clean[df_clean[class_property] == 1]
     else:
@@ -75,11 +59,11 @@ def analyze_embeddings(df, class_property='presence'):
     # Using Geometric Median for robustness
     centroid = geometric_median(presence_df[emb_cols].values)
     
-    # 3. Similarities for ALL points
+    # Similarities for ALL points
     similarities = np.dot(df_clean[emb_cols].values, centroid)
     df_clean['similarity'] = similarities
     
-    # 4. Threshold Calculation
+    # Threshold Calculation
     res_meta = {
         "centroid": centroid,
         "similarities": similarities,

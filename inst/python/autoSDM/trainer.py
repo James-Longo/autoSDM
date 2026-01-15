@@ -9,19 +9,14 @@ def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='p
     """
     Shared logic for cleaning, sanitizing, and determining nuisance optima.
     """
-    # 1. Class Property Detection
+    # 1. Class Property Detection - check multiple common naming conventions
     if class_property not in df.columns:
-        if 'present?' in df.columns:
-            class_property = 'present?'
-            sys.stderr.write("Using 'present?' as class property.\n")
-        elif 'presence' in df.columns:
-            class_property = 'presence'
-            sys.stderr.write("Using 'presence' as class property.\n")
-        elif 'present' in df.columns:
-            class_property = 'present'
-            sys.stderr.write("Using 'present' as class property.\n")
+        for candidate in ['present?', 'presence', 'Present.', 'Present', 'PRESENCE', 'present']:
+            if candidate in df.columns:
+                class_property = candidate
+                break
         else:
-            raise ValueError(f"Class property '{class_property}' not found in DataFrame.")
+            raise ValueError(f"Class property '{class_property}' not found in DataFrame. Available columns: {list(df.columns)[:10]}...")
 
     all_predictors = ecological_vars + nuisance_vars
     
