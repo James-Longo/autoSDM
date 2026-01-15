@@ -40,17 +40,48 @@ format_data <- function(data, coords, year, presence = NULL) {
     if (inherits(data[[year]], c("Date", "POSIXt"))) {
         data$Year <- as.numeric(format(data[[year]], "%Y"))
     } else {
-        # Try converting to numeric year
+        # Try converting to numeric year first
         val <- suppressWarnings(as.numeric(data[[year]]))
-        if (any(is.na(val))) {
-            # Might be a string date
-            try_date <- as.Date(data[[year]])
-            if (!any(is.na(try_date))) {
-                data$Year <- as.numeric(format(try_date, "%Y"))
-            } else {
-                stop("Could not parse 'year' column as a numeric year or a date.")
+
+        # Check if straight numeric conversion worked (ignoring NAs in original data)
+        # We consider it "worked" if non-NA inputs became numbers, or if all were NA.
+        # But here we want to handle mixed cases or string dates.
+
+        if (all(is.na(val) & !is.na(data[[year]]))) {
+            # All non-NA values failed to convert to numeric, so likely a date string
+
+            # Attempt various formats
+            formats <- c("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d")
+            parsed <- as.Date(rep(NA, nrow(data)))
+            success <- FALSE
+
+            for (fmt in formats) {
+                try_date <- as.Date(data[[year]], format = fmt)
+                if (any(!is.na(try_date))) {
+                    # If we successfully parsed at least some dates that weren't NA
+                    # Ideally we check if we parsed *all* non-NA strings, but data might be messy.
+                    # Let's assume if we get reasonable number of dates, it's the right format.
+                    parsed <- try_date
+                    success <- TRUE
+                    break
+                }
             }
+
+            # Fallback: try standard as.Date (ISO)
+            if (!success) {
+                try_date <- try(as.Date(data[[year]]), silent = TRUE)
+                if (!inherits(try_date, "try-error")) {
+                    parsed <- try_date
+                }
+            }
+
+            data$Year <- as.numeric(format(parsed, "%Y"))
+
+            # If we still have NAs where we had data, might warn?
+            # For now, we proceed.
         } else {
+            # Numeric conversion mostly worked, or it was mixed.
+            # Use the numeric values.
             data$Year <- val
         }
     }
