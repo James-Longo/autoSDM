@@ -147,9 +147,11 @@ def main():
                 gdf = gdf.to_crs(epsg=4326)
             
             # Combine all features into one geometry
-            combined_geom = gdf.geometry.unary_union
-            geojson = mapping(combined_geom)
-            aoi = ee.Geometry(geojson)
+            # If the GDF has many features, unary_union can be slow and create a massive payload.
+            # We use the total bounds (envelope) for GEE processing to avoid the 10MB payload limit.
+            bounds = gdf.total_bounds # [minx, miny, maxx, maxy]
+            aoi = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+            sys.stderr.write(f"AOI simplified to bounding box: {bounds}\n")
         
         if args.mode == "ensemble":
             if not args.meta2:
