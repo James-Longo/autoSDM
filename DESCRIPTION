@@ -10,6 +10,7 @@ Imports:
     vroom,
     ggplot2,
     jsonlite,
-    rgee
+    rgee,
+    reticulate
 Suggests: 
     testthat (>= 3.0.0)

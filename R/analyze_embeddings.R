@@ -7,9 +7,9 @@
 #' @param nuisance_vars Character vector of columns to treat as nuisance variables.
 #' @return A list containing the results.
 #' @keywords internal
-analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL) {
-  if (!exists("py_venv_path")) {
-    stop("Please run ee_auth_service() first.")
+analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, python_path = NULL) {
+  if (is.null(python_path)) {
+    stop("python_path argument is required.")
   }
 
   # Create temp files
@@ -17,8 +17,6 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL) {
   tmp_out <- tempfile(fileext = ".csv")
 
   write.csv(df, tmp_in, row.names = FALSE)
-
-  py_exe <- file.path(py_venv_path, "Scripts", "python.exe")
 
   message("Calling Python analyzer (via system)...")
   args <- c(
@@ -32,7 +30,7 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL) {
     args <- c(args, "--nuisance-vars", paste(nuisance_vars, collapse = ","))
   }
 
-  status <- system2(py_exe, args = args, stdout = "", stderr = "")
+  status <- system2(python_path, args = args, stdout = "", stderr = "")
 
   if (status != 0) {
     stop("Python analysis failed.")

@@ -11,22 +11,32 @@
 #' @return A list containing model metadata, performance metrics, and paths to the generated maps.
 #' @export
 autoSDM <- function(data, aoi, output_dir = getwd(), nuisance_vars = NULL, scale = 10) {
-  if (!exists("py_venv_path")) {
-    py_venv_path <<- "venv" # Default
+  # 2. Python Configuration
+  # If py_venv_path is set globally, use it (for backward compatibility or testing)
+  if (exists("py_venv_path")) {
+    python_path <- file.path(py_venv_path, "Scripts", "python.exe")
+    if (!file.exists(python_path)) python_path <- file.path(py_venv_path, "bin", "python")
+  } else {
+    # Otherwise, use reticulate to find the active python
+    tryCatch(
+      {
+        python_path <- reticulate::py_config()$python
+      },
+      error = function(e) {
+        stop("Could not find a Python environment. Please run install_autoSDM() or configure reticulate.")
+      }
+    )
   }
 
-  py_exe <- file.path(py_venv_path, "Scripts", "python.exe")
-  if (!file.exists(py_exe)) {
-    # try linux/mac path
-    py_exe <- file.path(py_venv_path, "bin", "python")
-    if (!file.exists(py_exe)) {
-      stop(paste("Python executable not found in", py_venv_path))
-    }
+  if (!file.exists(python_path)) {
+    stop(paste("Python executable not found at:", python_path))
   }
 
-  # 1. Check GEE Readiness
+  # 1. Check GEE Readiness logic remains... (but using the found python_path)
+  message(sprintf("Using Python: %s", python_path))
+
   message("Checking Google Earth Engine authentication...")
-  auth_check <- system2(py_exe, args = c("-c", "import ee; try: ee.Initialize(); print('OK')\nexcept: exit(1)"), stdout = TRUE, stderr = NULL)
+  auth_check <- system2(python_path, args = c("-c", "import ee; try: ee.Initialize(); print('OK')\nexcept: exit(1)"), stdout = TRUE, stderr = NULL)
 
   if (length(auth_check) == 0 || auth_check != "OK") {
     stop("Google Earth Engine is not initialized or authenticated in the Python environment.\nPlease run 'earthengine authenticate' in your terminal or ensure your credentials are set.")
@@ -42,23 +52,21 @@ autoSDM <- function(data, aoi, output_dir = getwd(), nuisance_vars = NULL, scale
 
   # 3. Step 1: Extract Embeddings
   message("--- Step 1: Extracting Alpha Earth Embeddings ---")
-  data_with_emb <- extract_embeddings(data, scale = scale)
+  data_with_emb <- extract_embeddings(data, scale = scale, python_path = python_path)
   vroom::vroom_write(data_with_emb, extract_csv, delim = ",")
 
   # 4. Step 2 & 3: Multi-Model Analysis
   message("--- Step 2: Running Centroid Analysis ---")
   # We call the internal analyze function
-  res_centroid <- analyze_embeddings(data_with_emb, method = "centroid")
+  res_centroid <- analyze_embeddings(data_with_emb, method = "centroid", python_path = python_path)
 
   message("--- Step 3: Running Maxent Analysis ---")
-  res_maxent <- analyze_embeddings(data_with_emb, method = "maxent", nuisance_vars = nuisance_vars)
+  res_maxent <- analyze_embeddings(data_with_emb, method = "maxent", nuisance_vars = nuisance_vars, python_path = python_path)
 
   # We need the .json metadata paths produced by the internal analyze function
   # Since' analyze_embeddings' uses temp files and cleans them up, we should
   # probably modify it or just call the CLI directly here to get permanent files.
   # Let's call the CLI directly for better control in this pipeline.
-
-  py_exe <- file.path(py_venv_path, "Scripts", "python.exe")
 
   # 5. Step 4: Ensemble Extrapolation
   message("--- Step 4: Generating Ensemble Extrapolation Map ---")
@@ -83,11 +91,11 @@ autoSDM <- function(data, aoi, output_dir = getwd(), nuisance_vars = NULL, scale
   }
 
   # Actually run the models to save the meta files permanently in output_dir
-  system2(py_exe, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(centroid_meta), "--method", "centroid"))
-  system2(py_exe, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(maxent_meta), "--method", "maxent", if (!is.null(nuisance_vars)) c("--nuisance-vars", paste(nuisance_vars, collapse = ","))))
+  system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(centroid_meta), "--method", "centroid"))
+  system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(maxent_meta), "--method", "maxent", if (!is.null(nuisance_vars)) c("--nuisance-vars", paste(nuisance_vars, collapse = ","))))
 
   # Run ensemble
-  status <- system2(py_exe, args = args, stdout = "", stderr = "")
+  status <- system2(python_path, args = args, stdout = "", stderr = "")
 
   if (status != 0) {
     stop("Ensemble extrapolation failed.")
