@@ -1,16 +1,16 @@
-# Tasks: Generalized Covariate Standardization
-
-- [x] Implement Standardized Method (Random Forest)
-    - [x] Implement `train_standardized_model` in `trainer.py`
-    - [x] Implement automated nuisance optima detection
-    - [x] Implement `generate_standardized_prediction_map` in `extrapolate.py`
-- [x] Update CLI and R Wrappers
-    - [x] Update `cli.py` with `--method` and `--nuisance-vars`
-    - [x] Update `autoSDM.R`, `analyze_embeddings.R`, and `extrapolate.R`
-- [x] Verification and Robustness
-    - [x] Test with presence-only (Centroid) data
-    - [x] Test with presence/absence (Standardized) data
-    - [x] Verify with real Mountain Birdwatch data
-    - [x] Implement automated missing value alerts
-- [x] Documentation
-    - [x] Update `walkthrough.md` with Standardized Mode instructions
+- [x] R Package Refactoring
+    - [x] Create `R/data_utils.R` with `format_data`
+    - [x] Refactor `R/autoSDM.R` for ensemble-only consolidated workflow
+    - [x] Update `NAMESPACE` to only export `format_data` and `autoSDM`
+    - [x] Make `ee_auth_service`, `extract_embeddings`, `analyze_embeddings`, `extrapolate` internal
+- [x] Python Package Refactoring
+    - [x] Update `cli.py` for optional `--key` and GEE session auth
+    - [x] Add polygon support via `--aoi-path` in `cli.py`
+    - [x] Delete `sa-key.json`
+- [x] Documentation & Verification
+    - [x] Update `README.md` and `walkthrough.md`
+    - [x] Verify full pipeline logic with tests
+- [x] GitHub Initialization & Fixes
+    - [x] Initialize repo and push to GitHub
+    - [x] Fix date parsing in format_data
+    - [x] Fix column collision in format_data
