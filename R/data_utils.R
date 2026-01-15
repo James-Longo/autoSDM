@@ -116,7 +116,16 @@ format_data <- function(data, coords, year, presence = NULL, nuisance_vars = NUL
         }
     }
 
-    # 9. Remove rows with NA values
+    # 9. Filter to years with Alpha Earth data (2017+)
+    rows_before <- nrow(result)
+    result <- result[result$year >= 2017 & result$year <= 2024, ]
+    rows_after <- nrow(result)
+
+    if (rows_before != rows_after) {
+        message(sprintf("Removed %d rows outside Alpha Earth coverage (2017-2024).", rows_before - rows_after))
+    }
+
+    # 10. Remove rows with NA values
     rows_before <- nrow(result)
     result <- na.omit(result)
     rows_after <- nrow(result)
