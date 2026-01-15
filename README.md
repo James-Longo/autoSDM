@@ -12,6 +12,21 @@
 
 ---
 
+## 📦 Installation
+
+To install `autoSDM` directly from GitHub:
+
+```r
+# install.packages("devtools")
+devtools::install_github("James-Longo/autoSDM")
+```
+
+**System Requirements:**
+- **Python 3.9+**: Required for the backend.
+- **Google Earth Engine**: You must have a GEE account and be authenticated (`earthengine authenticate`).
+
+---
+
 ## 🚀 Quick Start (R)
 
 ```r
