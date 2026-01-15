@@ -12,13 +12,14 @@ ensure_autoSDM_dependencies <- function(python_path) {
 
     required_pkgs <- c("earthengine-api", "pandas", "numpy", "geopandas", "shapely")
 
-    # Check import
-    # specific check script
+    # Check import - use simple import test for each package
+    # earthengine-api imports as 'ee', others import as their package name
+    import_names <- c("ee", "pandas", "numpy", "geopandas", "shapely")
+
     check_code <- paste0(
         "try:\n",
-        paste0("    import ", required_pkgs, collapse = "\n"),
-        "\n    print('OK')\n",
-        "except Exception as e: exit(1)"
+        paste0("    import ", import_names, collapse = "\n"),
+        "\n    print('OK')\nexcept: exit(1)"
     )
 
     status <- system2(python_path, args = c("-c", shQuote(check_code)), stdout = FALSE, stderr = FALSE)
@@ -27,7 +28,6 @@ ensure_autoSDM_dependencies <- function(python_path) {
         message("Missing required Python dependencies. Installing now... (This may take a moment)")
 
         # We assume pip is available as -m pip.
-        # This is standard for most python envs.
         install_args <- c("-m", "pip", "install", required_pkgs, "--quiet", "--upgrade")
 
         install_status <- system2(python_path, args = install_args)
@@ -37,38 +37,69 @@ ensure_autoSDM_dependencies <- function(python_path) {
         }
         message("Dependencies installed successfully.")
     }
+}
 
 #' Resolve Python Path
 #'
-#' Helper to find the Python executable using:
+#' Helper to find the Python executable using multiple fallback methods:
 #' 1. Explicit argument
-#' 2. Reticulate active configuration
-#' 3. Legacy global variable (py_venv_path)
+#' 2. Reticulate active/discovered configuration
+#' 3. System PATH (python3, python)
+#' 4. Legacy global variable (py_venv_path)
 #'
 #' @param path Optional explicit path.
 #' @return Path to python executable or NULL.
 #' @keywords internal
 resolve_python_path <- function(path = NULL) {
-    if (!is.null(path)) return(path)
+    # 1. Explicit argument
+    if (!is.null(path) && file.exists(path)) {
+        return(path)
+    }
 
-    # Try reticulate
+    # 2. Try reticulate's py_config (active python)
     path <- tryCatch(
         {
-            reticulate::py_config()$python
+            cfg <- reticulate::py_config()
+            if (!is.null(cfg$python) && file.exists(cfg$python)) cfg$python else NULL
         },
-        error = function(e) {
-            NULL
-        }
+        error = function(e) NULL
     )
-    if (!is.null(path)) return(path)
+    if (!is.null(path)) {
+        return(path)
+    }
 
-    # Legacy global
-    if (exists("py_venv_path")) {
-        candidate <- file.path(py_venv_path, "Scripts", "python.exe")
-        if (file.exists(candidate)) return(candidate)
-        
-        candidate <- file.path(py_venv_path, "bin", "python")
-        if (file.exists(candidate)) return(candidate)
+    # 3. Try reticulate's py_discover_config (find any python)
+    path <- tryCatch(
+        {
+            cfg <- reticulate::py_discover_config()
+            if (!is.null(cfg$python) && file.exists(cfg$python)) cfg$python else NULL
+        },
+        error = function(e) NULL
+    )
+    if (!is.null(path)) {
+        return(path)
+    }
+
+    # 4. Try system PATH - look for python3 or python
+    for (cmd in c("python3", "python")) {
+        sys_python <- Sys.which(cmd)
+        if (sys_python != "" && file.exists(sys_python)) {
+            return(sys_python)
+        }
+    }
+
+    # 5. Legacy global variable fallback
+    if (exists("py_venv_path", envir = .GlobalEnv)) {
+        venv <- get("py_venv_path", envir = .GlobalEnv)
+        candidate <- file.path(venv, "Scripts", "python.exe")
+        if (file.exists(candidate)) {
+            return(candidate)
+        }
+
+        candidate <- file.path(venv, "bin", "python")
+        if (file.exists(candidate)) {
+            return(candidate)
+        }
     }
 
     return(NULL)
