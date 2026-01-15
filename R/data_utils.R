@@ -116,6 +116,15 @@ format_data <- function(data, coords, year, presence = NULL, nuisance_vars = NUL
         }
     }
 
+    # 9. Remove rows with NA values
+    rows_before <- nrow(result)
+    result <- na.omit(result)
+    rows_after <- nrow(result)
+
+    if (rows_before != rows_after) {
+        message(sprintf("Removed %d rows with missing values.", rows_before - rows_after))
+    }
+
     # List final columns
     cols_desc <- paste(names(result), collapse = ", ")
     message(sprintf("Data formatted: %d rows, %d columns (%s)", nrow(result), ncol(result), cols_desc))
