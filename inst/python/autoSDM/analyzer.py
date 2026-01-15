@@ -21,10 +21,11 @@ def geometric_median(X, eps=1e-5, max_iter=100):
         y = new_y
     return y
 
-def analyze_embeddings(df, class_property='presence'):
+def analyze_embeddings(df, class_property='present'):
     """
     Analyzes embeddings: calculates species centroid, cosine similarity, and 
     several thresholds (95% TPR, 95% TNR, Balanced) if presence/absence is available.
+    Expects lowercase column name 'present' for presence/absence data.
     """
     emb_cols = [f"A{i:02d}" for i in range(64)]
     
@@ -33,9 +34,9 @@ def analyze_embeddings(df, class_property='presence'):
     if missing:
         raise ValueError(f"Missing embedding columns: {missing}")
     
-    # Auto-detect presence column with various naming conventions
+    # Auto-detect presence column - try common variations
     if class_property not in df.columns:
-        for candidate in ['present?', 'presence', 'Present.', 'Present', 'PRESENCE']:
+        for candidate in ['present', 'presence', 'Present', 'Present.', 'present?']:
             if candidate in df.columns:
                 class_property = candidate
                 break

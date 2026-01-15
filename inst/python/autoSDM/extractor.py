@@ -30,20 +30,21 @@ class GEEExtractor:
     def extract_embeddings(self, df, scale=10):
         """
         Extracts Alpha Earth embeddings for locations in a DataFrame.
+        Expects lowercase column names: year, longitude, latitude
         """
         asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
         
         # Alpha Earth range: 2017-2024
-        df = df[(df['Year'] >= 2017) & (df['Year'] <= 2024)].copy()
+        df = df[(df['year'] >= 2017) & (df['year'] <= 2024)].copy()
         if df.empty:
             sys.stderr.write("No locations within the 2017-2024 year range found.\n")
             return pd.DataFrame()
 
-        years = sorted(df['Year'].unique())
+        years = sorted(df['year'].unique())
         all_results = []
         
         for yr in years:
-            yr_df = df[df['Year'] == yr].copy()
+            yr_df = df[df['year'] == yr].copy()
             sys.stderr.write(f"Processing {len(yr_df)} points for year {int(yr)} at scale {scale}m...\n")
             
             img = ee.ImageCollection(asset_path)\
@@ -53,7 +54,7 @@ class GEEExtractor:
             CHUNK_SIZE = 4000
             features = []
             for idx, row in yr_df.iterrows():
-                geom = ee.Geometry.Point([row['Longitude'], row['Latitude']])
+                geom = ee.Geometry.Point([row['longitude'], row['latitude']])
                 feat = ee.Feature(geom, {'orig_index': str(idx)})
                 features.append(feat)
             

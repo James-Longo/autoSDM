@@ -5,13 +5,13 @@ import sys
 import os
 import json
 
-def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='presence'):
+def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='present'):
     """
     Shared logic for cleaning, sanitizing, and determining nuisance optima.
     """
     # 1. Class Property Detection - check multiple common naming conventions
     if class_property not in df.columns:
-        for candidate in ['present?', 'presence', 'Present.', 'Present', 'PRESENCE', 'present']:
+        for candidate in ['present', 'presence', 'Present', 'Present.', 'present?']:
             if candidate in df.columns:
                 class_property = candidate
                 break
@@ -21,7 +21,7 @@ def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='p
     all_predictors = ecological_vars + nuisance_vars
     
     # 2. Sanitize column names for GEE
-    name_map = {col: col.replace('.', '_') for col in all_predictors + [class_property, 'Latitude', 'Longitude']}
+    name_map = {col: col.replace('.', '_') for col in all_predictors + [class_property, 'latitude', 'longitude']}
     df = df.rename(columns=name_map)
     all_predictors = [name_map[col] for col in all_predictors]
     nuisance_vars = [name_map[col] for col in nuisance_vars]
@@ -86,7 +86,7 @@ def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='p
     features = []
     for _, row in df_clean.iterrows():
         props = {col: float(row[col]) for col in all_predictors + [class_property]}
-        geom = ee.Geometry.Point([row['Longitude'], row['Latitude']])
+        geom = ee.Geometry.Point([row['longitude'], row['latitude']])
         features.append(ee.Feature(geom, props))
     fc = ee.FeatureCollection(features)
 
@@ -100,7 +100,7 @@ def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='p
         'ecological_vars': ecological_vars
     }
 
-def train_rf_model(df, nuisance_vars, ecological_vars, class_property='presence', key_path=None):
+def train_rf_model(df, nuisance_vars, ecological_vars, class_property='present', key_path=None):
     if key_path:
         ee.Initialize(ee.ServiceAccountCredentials(json.load(open(key_path))["client_email"], key_path))
 
@@ -121,7 +121,7 @@ def train_rf_model(df, nuisance_vars, ecological_vars, class_property='presence'
 
     return classifier, data['nuisance_optima'], data['df_clean'], thresholds
 
-def train_maxent_model(df, nuisance_vars, ecological_vars, class_property='presence', key_path=None):
+def train_maxent_model(df, nuisance_vars, ecological_vars, class_property='present', key_path=None):
     if key_path:
         ee.Initialize(ee.ServiceAccountCredentials(json.load(open(key_path))["client_email"], key_path))
 

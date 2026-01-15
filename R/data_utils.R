@@ -1,53 +1,64 @@
 #' Format Data for autoSDM
 #'
 #' This function standardizes input data frames for use in the autoSDM pipeline.
-#' It ensures coordinate columns are named 'Latitude' and 'Longitude',
-#' extracts the year from date columns if necessary, and renames the
-#' presence column to 'present?'.
+#' It renames coordinate/year/presence columns to standard lowercase names,
+#' optionally keeps nuisance variables, and removes all other columns.
 #'
 #' @param data A data frame containing your survey data.
 #' @param coords A character vector of length 2 specifying the longitude and latitude columns IN ORDER: c(longitude_col, latitude_col). Note: Longitude first, then Latitude!
 #' @param year A character string specifying the year or date column.
 #' @param presence Optional. A character string specifying the presence/absence column (values should be 0 or 1).
-#' @return A standardized data frame ready for `autoSDM()`.
+#' @param nuisance_vars Optional. A character vector of column names to keep as nuisance variables (e.g., c("elevation", "aspect")).
+#' @return A standardized data frame ready for `autoSDM()` with lowercase column names.
 #' @export
-format_data <- function(data, coords, year, presence = NULL) {
+format_data <- function(data, coords, year, presence = NULL, nuisance_vars = NULL) {
     if (!is.data.frame(data)) {
         stop("Input 'data' must be a data frame.")
     }
 
-    # 1. Coordinate Standardization
+    # 1. Coordinate Validation
     if (length(coords) != 2) {
         stop("'coords' must be a character vector of length 2: c(longitude_col, latitude_col)")
     }
 
-    # Check if columns exist
     missing_cols <- setdiff(coords, names(data))
     if (length(missing_cols) > 0) {
         stop(paste("Coordinate columns not found in data:", paste(missing_cols, collapse = ", ")))
     }
 
-    # Rename to Longitude/Latitude securely
-    # Use temporary names to avoid collision if swapping e.g. c("Latitude", "Longitude")
-    idx_lon <- which(names(data) == coords[1])
-    idx_lat <- which(names(data) == coords[2])
+    # 2. Year Validation
+    if (!year %in% names(data)) {
+        stop(paste("Year column not found:", year))
+    }
 
-    names(data)[idx_lon] <- "TEMP_LONGITUDE_PLACEHOLDER"
-    names(data)[idx_lat] <- "TEMP_LATITUDE_PLACEHOLDER"
+    # 3. Presence Validation
+    if (!is.null(presence) && !presence %in% names(data)) {
+        stop(paste("Presence column not found:", presence))
+    }
 
-    names(data)[names(data) == "TEMP_LONGITUDE_PLACEHOLDER"] <- "Longitude"
-    names(data)[names(data) == "TEMP_LATITUDE_PLACEHOLDER"] <- "Latitude"
+    # 4. Nuisance Variables Validation
+    if (!is.null(nuisance_vars)) {
+        missing_nuisance <- setdiff(nuisance_vars, names(data))
+        if (length(missing_nuisance) > 0) {
+            stop(paste("Nuisance columns not found in data:", paste(missing_nuisance, collapse = ", ")))
+        }
+    }
+
+    # 5. Build the output data frame with only required columns
+    result <- data.frame(
+        longitude = data[[coords[1]]],
+        latitude = data[[coords[2]]],
+        stringsAsFactors = FALSE
+    )
 
     # Sanity check: Warn if coordinates appear swapped
-    # Valid Latitude: -90 to 90, Valid Longitude: -180 to 180
-    sample_lat <- data$Latitude[!is.na(data$Latitude)][1]
-    sample_lon <- data$Longitude[!is.na(data$Longitude)][1]
+    sample_lat <- result$latitude[!is.na(result$latitude)][1]
+    sample_lon <- result$longitude[!is.na(result$longitude)][1]
 
     if (!is.null(sample_lat) && !is.null(sample_lon)) {
         lat_in_range <- sample_lat >= -90 && sample_lat <= 90
         lon_in_range <- sample_lon >= -180 && sample_lon <= 180
 
-        # Check if they might be swapped
         if (!lat_in_range && lon_in_range) {
             warning(sprintf(
                 "Coordinates may be SWAPPED! Latitude=%s is outside valid range [-90, 90].\n  Did you pass coords in the correct order? It should be: coords = c(longitude_col, latitude_col)\n  Your call: coords = c('%s', '%s')",
@@ -56,69 +67,58 @@ format_data <- function(data, coords, year, presence = NULL) {
         }
     }
 
-    # 2. Year Standardization
-    if (!year %in% names(data)) {
-        stop(paste("Year column not found:", year))
-    }
-
-    # Try to extract year if it's a date
-    if (inherits(data[[year]], c("Date", "POSIXt"))) {
-        data$Year <- as.numeric(format(data[[year]], "%Y"))
+    # 6. Process Year (handle dates)
+    year_data <- data[[year]]
+    if (inherits(year_data, c("Date", "POSIXt"))) {
+        result$year <- as.numeric(format(year_data, "%Y"))
     } else {
-        # Try converting to numeric year first
-        val <- suppressWarnings(as.numeric(data[[year]]))
+        # Try numeric conversion
+        val <- suppressWarnings(as.numeric(year_data))
 
-        # Check if straight numeric conversion worked (ignoring NAs in original data)
-        # We consider it "worked" if non-NA inputs became numbers, or if all were NA.
-        # But here we want to handle mixed cases or string dates.
-
-        if (all(is.na(val) & !is.na(data[[year]]))) {
-            # All non-NA values failed to convert to numeric, so likely a date string
-
-            # Attempt various formats
+        if (all(is.na(val) & !is.na(year_data))) {
+            # Likely date strings - try common formats
             formats <- c("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d")
             parsed <- as.Date(rep(NA, nrow(data)))
-            success <- FALSE
 
             for (fmt in formats) {
-                try_date <- as.Date(data[[year]], format = fmt)
+                try_date <- as.Date(year_data, format = fmt)
                 if (any(!is.na(try_date))) {
-                    # If we successfully parsed at least some dates that weren't NA
-                    # Ideally we check if we parsed *all* non-NA strings, but data might be messy.
-                    # Let's assume if we get reasonable number of dates, it's the right format.
                     parsed <- try_date
-                    success <- TRUE
                     break
                 }
             }
 
-            # Fallback: try standard as.Date (ISO)
-            if (!success) {
-                try_date <- try(as.Date(data[[year]]), silent = TRUE)
+            # Fallback to standard as.Date
+            if (all(is.na(parsed))) {
+                try_date <- try(as.Date(year_data), silent = TRUE)
                 if (!inherits(try_date, "try-error")) {
                     parsed <- try_date
                 }
             }
 
-            data$Year <- as.numeric(format(parsed, "%Y"))
-
-            # If we still have NAs where we had data, might warn?
-            # For now, we proceed.
+            result$year <- as.numeric(format(parsed, "%Y"))
         } else {
-            # Numeric conversion mostly worked, or it was mixed.
-            # Use the numeric values.
-            data$Year <- val
+            result$year <- val
         }
     }
 
-    # 3. Presence Standardization
+    # 7. Add presence column (lowercase "present")
     if (!is.null(presence)) {
-        if (!presence %in% names(data)) {
-            stop(paste("Presence column not found:", presence))
-        }
-        names(data)[names(data) == presence] <- "present?"
+        result$present <- as.numeric(data[[presence]])
     }
 
-    message("Data formatted successfully. Columns: ", paste(names(data), collapse = ", "))
-    return(data)
+    # 8. Add nuisance variables (lowercase names)
+    if (!is.null(nuisance_vars)) {
+        for (nv in nuisance_vars) {
+            # Create lowercase column name
+            col_name <- tolower(gsub("[^a-zA-Z0-9]", "_", nv))
+            result[[col_name]] <- data[[nv]]
+        }
+    }
+
+    # List final columns
+    cols_desc <- paste(names(result), collapse = ", ")
+    message(sprintf("Data formatted: %d rows, %d columns (%s)", nrow(result), ncol(result), cols_desc))
+
+    return(result)
 }
