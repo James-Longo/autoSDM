@@ -9,6 +9,7 @@ LazyData: true
 Imports: 
     vroom,
     ggplot2,
-    jsonlite
+    jsonlite,
+    rgee
 Suggests: 
     testthat (>= 3.0.0)
