@@ -53,40 +53,43 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, py
   if (method == "centroid") {
     dot_products <- df_clean$similarity
     mean_emb <- meta$centroid
-    threshold_5pct <- meta$threshold_5pct
-    threshold_50pct <- meta$threshold_50pct
 
-    # Create histogram
+    # Get thresholds from new structure (may be nested under 'thresholds')
+    thresholds <- meta$thresholds
+    threshold_95tpr <- if (!is.null(thresholds$`95tpr`)) thresholds$`95tpr` else NULL
+    threshold_balanced <- if (!is.null(thresholds$balanced)) thresholds$balanced else NULL
+
+    # Create histogram (skip threshold line if not available)
     library(ggplot2)
     p <- ggplot(data.frame(dot_product = dot_products), aes(x = dot_product)) +
       geom_histogram(bins = 30, fill = "#69b3a2", color = "#e9ecef", alpha = 0.9) +
-      geom_vline(aes(xintercept = threshold_5pct, color = "5th Percentile"), linetype = "dotted", linewidth = 1) +
-      scale_color_manual(name = "Threshold", values = c("5th Percentile" = "blue")) +
       theme_minimal() +
       labs(
         title = "Cosine Similarity to Species Centroid",
-        subtitle = paste0("Core Niche Analysis (5th Pct Threshold: ", round(threshold_5pct, 3), ")"),
+        subtitle = "Distribution of embedding similarities",
         x = "Cosine Similarity (Dot Product)",
         y = "Frequency"
       )
 
+    # Add threshold line if available
+    if (!is.null(threshold_95tpr) && is.numeric(threshold_95tpr)) {
+      p <- p + geom_vline(xintercept = threshold_95tpr, color = "blue", linetype = "dotted", linewidth = 1)
+    }
+
     return(list(
       mean_embedding = mean_emb,
       dot_products = dot_products,
-      threshold_5pct = threshold_5pct,
-      threshold_50pct = threshold_50pct,
+      thresholds = thresholds,
       plot = p,
       data = df_clean,
       method = "centroid"
     ))
   } else {
-    message("Random Forest model trained and nuisance optima determined.")
+    message("Maxent/RF model trained.")
     return(list(
       data = df_clean,
-      method = "standardized",
-      nuisance_optima = meta$nuisance_optima,
-      ecological_vars = meta$ecological_vars,
-      nuisance_vars = meta$nuisance_vars,
+      method = method,
+      thresholds = meta$thresholds,
       meta = meta
     ))
   }
