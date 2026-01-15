@@ -10,26 +10,41 @@
 #' @param scale Optional. Resolution in meters for the final map. Defaults to 10.
 #' @return A list containing model metadata, performance metrics, and paths to the generated maps.
 #' @export
-autoSDM <- function(data, aoi, output_dir = getwd(), nuisance_vars = NULL, scale = 10) {
+autoSDM <- function(data, aoi, output_dir = getwd(), nuisance_vars = NULL, scale = 10, python_path = NULL) {
   # 2. Python Configuration
-  # If py_venv_path is set globally, use it (for backward compatibility or testing)
-  if (exists("py_venv_path")) {
-    python_path <- file.path(py_venv_path, "Scripts", "python.exe")
-    if (!file.exists(python_path)) python_path <- file.path(py_venv_path, "bin", "python")
-  } else {
-    # Otherwise, use reticulate to find the active python
-    tryCatch(
-      {
-        python_path <- reticulate::py_config()$python
-      },
-      error = function(e) {
-        stop("Could not find a Python environment. Please run install_autoSDM() or configure reticulate.")
-      }
-    )
+  python_path <- resolve_python_path(python_path)
+
+  if (is.null(python_path) || !file.exists(python_path)) {
+    stop("Could not find a valid Python environment.\nPlease ensure Python is installed and detected by `reticulate::py_config()`, or provide the `python_path` argument explicitly.")
   }
 
-  if (!file.exists(python_path)) {
-    stop(paste("Python executable not found at:", python_path))
+  # 3. Auto-configure Dependencies & PYTHONPATH
+  message("Checking Python dependencies...")
+  ensure_autoSDM_dependencies(python_path)
+
+  # Locate the python source directory (inst/python)
+  pkg_py_path <- system.file("python", package = "autoSDM")
+
+  # Fallback for local development (if package not installed but loaded)
+  if (pkg_py_path == "") {
+    if (file.exists(file.path(getwd(), "inst", "python"))) {
+      pkg_py_path <- file.path(getwd(), "inst", "python")
+    }
+  }
+
+  if (pkg_py_path != "") {
+    # Prepend to PYTHONPATH so 'autoSDM' module is found
+    old_pythonpath <- Sys.getenv("PYTHONPATH")
+    # Handle empty old path cleanly
+    new_pythonpath <- if (old_pythonpath == "") pkg_py_path else paste(pkg_py_path, old_pythonpath, sep = .Platform$path.sep)
+
+    Sys.setenv(PYTHONPATH = new_pythonpath)
+    # Restore on exit
+    on.exit(if (old_pythonpath == "") Sys.unsetenv("PYTHONPATH") else Sys.setenv(PYTHONPATH = old_pythonpath), add = TRUE)
+
+    message(sprintf("Added to PYTHONPATH: %s", pkg_py_path))
+  } else {
+    warning("Could not locate 'inst/python' source. Python 'autoSDM' module might not be found.")
   }
 
   # 1. Check GEE Readiness logic remains... (but using the found python_path)

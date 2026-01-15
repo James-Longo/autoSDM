@@ -8,8 +8,10 @@
 #' @return A list containing the results.
 #' @keywords internal
 analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, python_path = NULL) {
+  python_path <- resolve_python_path(python_path)
+
   if (is.null(python_path)) {
-    stop("python_path argument is required.")
+    stop("python_path could not be resolved. Please configure reticulate or pass python_path explicitly.")
   }
 
   # Create temp files

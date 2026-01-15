@@ -3,14 +3,19 @@
 #' @param json_path Path to the service account JSON key. Defaults to GEE_SERVICE_ACCOUNT_KEY env var.
 #' @param venv_path Path to the Python virtual environment.
 #' @keywords internal
-ee_auth_service <- function(json_path = Sys.getenv("GEE_SERVICE_ACCOUNT_KEY"), venv_path = "venv") {
+ee_auth_service <- function(json_path = Sys.getenv("GEE_SERVICE_ACCOUNT_KEY"), venv_path = NULL) {
   # Store paths for later use
   sa_json_key <<- json_path
-  py_venv_path <<- venv_path
 
-  py_exe <- file.path(venv_path, "Scripts", "python.exe")
-  if (!file.exists(py_exe)) {
-    stop(sprintf("Python venv not found at %s. Please run setup first.", py_exe))
+  if (!is.null(venv_path)) {
+    py_venv_path <<- venv_path
+
+    py_exe <- file.path(venv_path, "Scripts", "python.exe")
+    if (!file.exists(py_exe)) py_exe <- file.path(venv_path, "bin", "python")
+
+    if (!file.exists(py_exe)) {
+      stop(sprintf("Python venv not found at %s. Please run setup first.", venv_path))
+    }
   }
 
   message("GEE credentials set for system calls.")
@@ -23,8 +28,10 @@ ee_auth_service <- function(json_path = Sys.getenv("GEE_SERVICE_ACCOUNT_KEY"), v
 #' @return A data frame with added A00-A63 embedding columns.
 #' @keywords internal
 extract_embeddings <- function(df, scale = 10, python_path = NULL) {
+  python_path <- resolve_python_path(python_path)
+
   if (is.null(python_path)) {
-    stop("python_path argument is required.")
+    stop("python_path could not be resolved. Please configure reticulate or pass python_path explicitly.")
   }
 
   # Create temp files
