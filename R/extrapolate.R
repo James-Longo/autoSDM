@@ -13,9 +13,12 @@
 #' @param zip Logical. If TRUE, zips the output rasters into a single archive (local mode only).
 #' @return A list containing the paths to the generated map files, HTML, or GCS export details.
 #' @keywords internal
-extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10, coarse_meta_path = NULL, view = FALSE, gcs_bucket = NULL, wait = FALSE, zip = FALSE) {
-  if (!exists("py_venv_path")) {
-    stop("Please run ee_auth_service() first.")
+extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10, coarse_meta_path = NULL, view = FALSE, gcs_bucket = NULL, wait = FALSE, zip = FALSE, python_path = NULL) {
+  # Resolve python path using the centralized helper
+  py_exe <- resolve_python_path(python_path)
+
+  if (is.null(py_exe) || !file.exists(py_exe)) {
+    stop("Could not find a valid Python environment.\nPlease ensure Python is installed and detected by `reticulate::py_config()`, or provide the `python_path` argument explicitly.")
   }
 
   # Create input temp file
@@ -28,8 +31,6 @@ extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10
   if (!exists("sa_json_key")) {
     sa_json_key <- Sys.getenv("GEE_SERVICE_ACCOUNT_KEY")
   }
-
-  py_exe <- file.path(py_venv_path, "Scripts", "python.exe")
 
   message("Calling Python extrapolation logic at scale ", scale, "m...")
   args <- c(
