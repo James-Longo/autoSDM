@@ -57,8 +57,16 @@ def main():
                 "thresholds": res['thresholds']
             }
         elif args.method in ["rf", "maxent"]:
-            # RF or Maxent Modes
+            # RF or Maxent Modes - requires GEE for cloud training
+            import ee
             from autoSDM.trainer import train_rf_model, train_maxent_model
+            
+            # Initialize GEE if not already done
+            try:
+                ee.Initialize()
+            except Exception:
+                pass  # Already initialized or will fail in trainer
+            
             nuisance_vars = args.nuisance_vars.split(',') if args.nuisance_vars else []
             ecological_vars = [f"A{i:02d}" for i in range(64)]
             
