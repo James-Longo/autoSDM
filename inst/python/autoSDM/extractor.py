@@ -75,17 +75,25 @@ class GEEExtractor:
                     num_features = len(res.get('features', []))
                     sys.stderr.write(f"DEBUG extractor: Got {num_features} features from GEE for year {int(yr)} chunk {i//CHUNK_SIZE}\n")
                     
-                    for feat in res['features']:
+                    # Debug first feature
+                    if num_features > 0:
+                        first_props = res['features'][0]['properties']
+                        sys.stderr.write(f"DEBUG extractor: First feature keys: {list(first_props.keys())[:15]}\n")
+                        if 'A00' in first_props:
+                            sys.stderr.write(f"DEBUG extractor: First A00 value: {first_props['A00']} (type: {type(first_props['A00']).__name__})\n")
+                    
+                    for feat_idx, feat in enumerate(res['features']):
                         props = feat['properties']
-                        if 'A00' in props:
+                        if 'A00' in props and props['A00'] is not None:
                             idx = int(props.pop('orig_index'))
                             for k, v in props.items():
                                 yr_df.at[idx, k] = v
                             found_any = True
                         else:
-                            # Debug: Show what properties we did get
-                            if not found_any:
-                                sys.stderr.write(f"DEBUG extractor: Feature has no A00. Keys: {list(props.keys())[:10]}\n")
+                            # Debug: Show what properties we did get (only first one)
+                            if feat_idx == 0:
+                                a00_val = props.get('A00', 'NOT_PRESENT')
+                                sys.stderr.write(f"DEBUG extractor: Feature 0 has A00={a00_val}. All keys: {list(props.keys())}\n")
                     
                     if not found_any:
                         sys.stderr.write(f"Warning: No valid embeddings found for {int(yr)} chunk {i//CHUNK_SIZE}\n")
