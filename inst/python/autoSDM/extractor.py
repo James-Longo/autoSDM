@@ -163,16 +163,28 @@ class GEEExtractor:
         else:
             raise ValueError(f"Invalid background method: {method}")
 
-        # 4. Extract coordinates from GEE
-        bg_info = bg_fc.getInfo()
+        # 4. Extract coordinates from GEE in chunks to avoid the 5000 feature limit
         bg_coords = []
-        for feat in bg_info['features']:
-            coords = feat['geometry']['coordinates']
-            bg_coords.append({
-                'longitude': coords[0],
-                'latitude': coords[1],
-                'present': 0
-            })
+        chunk_size = 4000
+        
+        # Get total size safely
+        try:
+            total_count = int(bg_fc.size().getInfo())
+        except:
+            total_count = n_bg
+
+        bg_list = bg_fc.toList(total_count)
+        for i in range(0, total_count, chunk_size):
+            sys.stderr.write(f"Retrieving background chunk {i//chunk_size + 1}...\n")
+            chunk = ee.List(bg_list.slice(i, i + chunk_size))
+            features = chunk.getInfo()
+            for feat in features:
+                coords = feat['geometry']['coordinates']
+                bg_coords.append({
+                    'longitude': coords[0],
+                    'latitude': coords[1],
+                    'present': 0
+                })
         
         if not bg_coords:
             sys.stderr.write("Warning: No background points could be generated. Check AOI/extent.\n")
