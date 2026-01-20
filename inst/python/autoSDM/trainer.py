@@ -168,9 +168,16 @@ def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='p
             reducer=ee.Reducer.mean(),
             scale=scale
         ).filter(ee.Filter.notNull(['A00']))
+        
+        # Debug: check size per year
+        yr_size = int(sampled_yr_fc.size().getInfo())
+        sys.stderr.write(f"Year {yr}: {len(features)} points -> {yr_size} valid samples.\n")
+        
         base_fcs.append(sampled_yr_fc)
 
     fc = ee.FeatureCollection(base_fcs).flatten()
+    total_samples = int(fc.size().getInfo())
+    sys.stderr.write(f"Total training FeatureCollection size: {total_samples}\n")
 
     return {
         'fc': fc,
@@ -185,26 +192,65 @@ def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='p
 def get_safe_scores_and_labels(clf, fc, class_property, name="Model"):
     """
     Safely retrieves scores and labels from a classified FeatureCollection.
-    Handles mismatches or empty results.
+    Handles mismatches, empty results, and "Too many concurrent aggregations" errors.
     """
+    import time
+    import random
+    
+    # Check if fc is empty BEFORE classification to avoid pointless GEE calls
+    count = 0
     try:
-        classified = fc.classify(clf, 'classification')
-        # Combined reduction for alignment
-        res = classified.reduceColumns(
-            reducer=ee.Reducer.toList().repeat(2),
-            selectors=['classification', class_property]
-        ).getInfo()
+        count = int(fc.size().getInfo())
+    except:
+        pass
         
-        scores = np.array(res['list'][0], dtype=float)
-        labels = np.array(res['list'][1], dtype=float)
-        
-        if scores.size == 0:
-            sys.stderr.write(f"Warning: {name} returned no scores.\n")
-            
-        return scores, labels
-    except Exception as e:
-        sys.stderr.write(f"Error retrieving scores for {name}: {e}\n")
+    if count == 0:
+        sys.stderr.write(f"Warning: {name} input FeatureCollection is empty.\n")
         return np.array([]), np.array([])
+
+    for attempt in range(3):
+        try:
+            classified = fc.classify(clf, 'classification_temp')
+            # 1. Inspect first feature to find score column
+            first = classified.first().getInfo()
+            if not first:
+                return np.array([]), np.array([])
+                
+            props = first['properties']
+            score_col = 'classification_temp'
+            if score_col not in props:
+                # Fallback to probability if classification_temp is missing
+                score_col = 'probability' if 'probability' in props else None
+            
+            if not score_col:
+                sys.stderr.write(f"Warning: {name} returned no identifiable score column. Keys: {list(props.keys())}\n")
+                return np.array([]), np.array([])
+
+            # 2. Combined reduction for alignment
+            res = classified.reduceColumns(
+                reducer=ee.Reducer.toList().repeat(2),
+                selectors=[score_col, class_property]
+            ).getInfo()
+            
+            scores = np.array(res['list'][0], dtype=float)
+            labels = np.array(res['list'][1], dtype=float)
+            
+            if scores.size == 0:
+                sys.stderr.write(f"Warning: {name} returned no scores.\n")
+                
+            return scores, labels
+        except Exception as e:
+            err_str = str(e)
+            if "Too many concurrent aggregations" in err_str or "Quotas were exceeded" in err_str:
+                wait = (2 ** attempt) + random.random()
+                sys.stderr.write(f"GEE Concurrency Limit hit for {name}. Retrying in {wait:.2f}s... (Attempt {attempt+1}/3)\n")
+                time.sleep(wait)
+                continue
+            
+            sys.stderr.write(f"Error retrieving scores for {name}: {e}\n")
+            return np.array([]), np.array([])
+    
+    return np.array([]), np.array([])
 
 def train_maxent_model(df, nuisance_vars, ecological_vars, class_property='present', key_path=None, scale=10):
     if key_path:
@@ -280,10 +326,14 @@ def run_cv_fold(fold_idx, df, nuisance_vars, ecological_vars, class_property, sc
 def run_parallel_cv(df, nuisance_vars, ecological_vars, class_property='present', scale=10, n_folds=5):
     from concurrent.futures import ThreadPoolExecutor
     df_f = assign_spatial_folds(df, n_folds=n_folds)
-    with ThreadPoolExecutor(max_workers=n_folds) as ex:
+    
+    # Reduced max_workers to 2 to avoid "Too many concurrent aggregations"
+    with ThreadPoolExecutor(max_workers=2) as ex:
         res = [r for r in ex.map(lambda i: run_cv_fold(i, df_f, nuisance_vars, ecological_vars, class_property, scale), range(n_folds)) if r]
     
-    avg = {}
+    if not res:
+        sys.stderr.write("Warning: All CV folds failed or returned no data.\n")
+        return {m: {'cbi': 0.0, 'auc': 0.5} for m in ['centroid', 'maxent', 'ensemble']}
     for m in ['centroid', 'maxent', 'ensemble']:
         avg[m] = {met: float(np.mean([r[m][met] for r in res])) for met in ['cbi', 'auc']}
     return avg
