@@ -38,18 +38,6 @@ def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='p
     if df_clean.empty:
         raise ValueError("No valid training data remaining after dropping missing values.")
 
-    # 3.5. Subsample if too large for GEE payload (Maxent limit is ~5000-10000 points depending on dimensions)
-    MAX_TRAIN_POINTS = 4000
-    if len(df_clean) > MAX_TRAIN_POINTS:
-        sys.stderr.write(f"Training data ({len(df_clean)} pts) exceeds GEE payload safety limit. Subsampling absences...\n")
-        presence_df = df_clean[df_clean[class_property] == 1]
-        absence_df = df_clean[df_clean[class_property] == 0]
-        
-        target_absences = max(500, MAX_TRAIN_POINTS - len(presence_df))
-        if len(absence_df) > target_absences:
-            absence_df = absence_df.sample(n=target_absences, random_state=42)
-            df_clean = pd.concat([presence_df, absence_df])
-            sys.stderr.write(f"New training size: {len(df_clean)} pts ({len(presence_df)} presences, {len(absence_df)} absences).\n")
 
     # 4. Handle Categorical Nuisance Vars
     encodings = {}
