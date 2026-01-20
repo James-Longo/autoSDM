@@ -55,12 +55,11 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, py
     dot_products <- df_clean$similarity
     mean_emb <- meta$centroid
 
-    # Get thresholds from new structure (may be nested under 'thresholds')
-    thresholds <- meta$thresholds
-    threshold_95tpr <- if (!is.null(thresholds$`95tpr`)) thresholds$`95tpr` else NULL
-    threshold_balanced <- if (!is.null(thresholds$balanced)) thresholds$balanced else NULL
+    metrics <- meta$metrics
+    cbi <- if (!is.null(metrics$cbi)) metrics$cbi else NULL
+    auc <- if (!is.null(metrics$auc)) metrics$auc else NULL
 
-    # Create histogram (skip threshold line if not available)
+    # Create histogram
     library(ggplot2)
     p <- ggplot(data.frame(dot_product = dot_products), aes(x = dot_product)) +
       geom_histogram(bins = 30, fill = "#69b3a2", color = "#e9ecef", alpha = 0.9) +
@@ -72,25 +71,23 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, py
         y = "Frequency"
       )
 
-    # Add threshold line if available
-    if (!is.null(threshold_95tpr) && is.numeric(threshold_95tpr)) {
-      p <- p + geom_vline(xintercept = threshold_95tpr, color = "blue", linetype = "dotted", linewidth = 1)
-    }
+    # CBI and AUC are returned as metrics.
 
     return(list(
       mean_embedding = mean_emb,
       dot_products = dot_products,
-      thresholds = thresholds,
+      metrics = metrics,
       plot = p,
       data = df_clean,
       method = "centroid"
     ))
   } else {
-    message("Maxent/RF model trained.")
+    message("Maxent model trained.")
     return(list(
       data = df_clean,
       method = method,
-      thresholds = meta$thresholds,
+      metrics = meta$metrics,
+      cv_results = meta$cv_results,
       meta = meta
     ))
   }
