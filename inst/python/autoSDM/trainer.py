@@ -5,6 +5,86 @@ import sys
 import os
 import json
 
+def assign_spatial_folds(df, n_folds=5, grid_size=None):
+    """
+    Assigns fold IDs based on spatial grid blocks.
+    If grid_size is None, it is calculated dynamically to ensure ~25 blocks.
+    """
+    df = df.copy()
+    
+    if grid_size is None:
+        # Dynamic grid sizing
+        lat_min, lat_max = df['latitude'].min(), df['latitude'].max()
+        lon_min, lon_max = df['longitude'].min(), df['longitude'].max()
+        
+        lat_range = lat_max - lat_min
+        lon_range = lon_max - lon_min
+        
+        # Target roughly 5x5 = 25 blocks to allow for sufficient variation
+        # We take the larger dimension to drive the scale
+        max_dim = max(lat_range, lon_range)
+        grid_size = max_dim / 5.0
+        
+        # Ensure a minimum practical size (e.g. 100m ~ 0.001 deg) to avoid numerical issues
+        grid_size = max(grid_size, 0.001)
+        sys.stderr.write(f"Dynamic Spatial Blocking: Grid Size={grid_size:.4f} degrees (Extent: {lon_range:.2f}x{lat_range:.2f})\n")
+
+    df['grid_x'] = (df['longitude'] / grid_size).apply(np.floor)
+    df['grid_y'] = (df['latitude'] / grid_size).apply(np.floor)
+    
+    # Combine grid coordinates into a unique ID
+    df['grid_id'] = df['grid_x'].astype(str) + "_" + df['grid_y'].astype(str)
+    
+    unique_grids = df['grid_id'].unique()
+    np.random.seed(42) # Deterministic blocking
+    np.random.shuffle(unique_grids)
+    
+    # Assign grids to folds
+    grid_to_fold = {grid: i % n_folds for i, grid in enumerate(unique_grids)}
+    df['fold'] = df['grid_id'].map(grid_to_fold)
+    
+    return df
+
+def calculate_classifier_metrics(scores_pos, scores_all):
+    """
+    Calculates CBI and AUC for a set of scores.
+    """
+    from autoSDM.analyzer import calculate_cbi
+    cbi = calculate_cbi(scores_pos, scores_all)
+    
+    # AUC calculation
+    # For speed and robustness, use a simple rank-based AUC
+    # We need background scores
+    # scores_all contains pos scores. Background = all - pos.
+    # But wait, scores_all is the full set, scores_pos is a subset.
+    
+    n_pos = len(scores_pos)
+    n_all = len(scores_all)
+    n_bg = n_all - n_pos
+    
+    if n_bg > 0 and n_pos > 0:
+        # Wilcoxon-Mann-Whitney U statistic based AUC
+        from scipy.stats import mannwhitneyu
+        # Mann-Whitney U test between pos and bg scores
+        # We need the bg scores explicitly
+        # This is a bit tricky if we only have all and pos.
+        # Let's assume we can differentiate them by values if they are unique, 
+        # but better to pass them explicitly or handle correctly.
+        # Actually, in SDM, 'all' often means 'background' or 'presence + background'.
+        # If scores_all is ALL points (including presences), then:
+        
+        # Simple iterative AUC (slow for large N but correct)
+        # For CV we usually have small test sets, but let's be careful.
+        # Let's use a faster way:
+        ranks = pd.Series(scores_all).rank()
+        pos_rank_sum = ranks[np.isin(scores_all, scores_pos)].sum()
+        u_stat = pos_rank_sum - (n_pos * (n_pos + 1) / 2)
+        auc = u_stat / (n_pos * n_bg)
+    else:
+        auc = 0.5
+        
+    return {'cbi': cbi, 'auc': float(auc)}
+
 def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='present', scale=10):
     """
     Shared logic for cleaning, sanitizing, and determining nuisance optima.
@@ -102,27 +182,6 @@ def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='p
         'ecological_vars': ecological_vars
     }
 
-def train_rf_model(df, nuisance_vars, ecological_vars, class_property='present', key_path=None, scale=10):
-    if key_path:
-        ee.Initialize(ee.ServiceAccountCredentials(json.load(open(key_path))["client_email"], key_path))
-
-    data = _prepare_training_data(df, nuisance_vars, ecological_vars, class_property, scale=scale)
-    
-    classifier = ee.Classifier.smileRandomForest(
-        numberOfTrees=500,
-        minLeafPopulation=10,
-        bagFraction=0.6
-    ).setOutputMode('PROBABILITY').train(
-        features=data['fc'],
-        classProperty=data['class_property'],
-        inputProperties=data['all_predictors']
-    )
-
-    thresholds = calculate_classifier_performance(classifier, data['fc'], data['class_property'])
-    sys.stderr.write(f"RF Analysis: AUC={thresholds['auc']:.4f}, Thresholds={thresholds}\n")
-
-    return classifier, data['nuisance_optima'], data['df_clean'], thresholds
-
 def train_maxent_model(df, nuisance_vars, ecological_vars, class_property='present', key_path=None, scale=10):
     if key_path:
         ee.Initialize(ee.ServiceAccountCredentials(json.load(open(key_path))["client_email"], key_path))
@@ -138,93 +197,50 @@ def train_maxent_model(df, nuisance_vars, ecological_vars, class_property='prese
         inputProperties=data['all_predictors']
     )
 
-    thresholds = calculate_classifier_performance(classifier, data['fc'], data['class_property'])
-    sys.stderr.write(f"Maxent Analysis: AUC={thresholds['auc']:.4f}, Thresholds={thresholds}\n")
-
-    return classifier, data['nuisance_optima'], data['df_clean'], thresholds
-
-def calculate_classifier_performance(classifier, fc, class_property):
-    # Perform classification server-side
-    classified = fc.classify(classifier, 'classification')
+    # Performance on train set
+    classified = data['fc'].classify(classifier, 'classification')
+    presence_probs = np.array(classified.filter(ee.Filter.eq(data['class_property'], 1)).aggregate_array('classification').getInfo(), dtype=float)
+    all_probs = np.array(classified.aggregate_array('classification').getInfo(), dtype=float)
     
-    # 1. Inspect one feature to find score column name
-    # Explicitly select only properties we might need to minimize payload
-    sample = ee.Feature(classified.first()).select(['classification', 'probability', class_property]).getInfo()
-    if not sample:
-        sys.stderr.write("Warning: Classified collection is empty.\n")
-        return {'95tpr': 0.1, '95tnr': 0.9, 'balanced': 0.5, 'auc': 0.0}
-        
-    props = sample['properties']
-    score_col = 'classification' if 'classification' in props else 'probability'
+    metrics = calculate_classifier_metrics(presence_probs, all_probs)
+    sys.stderr.write(f"Maxent Analysis: CBI={metrics['cbi']:.4f}, AUC={metrics['auc']:.4f}\n")
 
-    # 2. Performance calculation server-side to avoid payload limits
-    presence_only = classified.filter(ee.Filter.eq(class_property, 1))
-    absence_only = classified.filter(ee.Filter.eq(class_property, 0))
+    return classifier, data['nuisance_optima'], data['df_clean'], metrics
+
+def run_cv_fold(fold_idx, df, nuisance_vars, ecological_vars, class_property, scale):
+    import ee
+    train_df = df[df['fold'] != fold_idx]
+    test_df = df[df['fold'] == fold_idx]
+    if test_df.empty: return None
+
+    # Centroid
+    from autoSDM.analyzer import analyze_embeddings
+    c_res = analyze_embeddings(train_df, class_property=class_property)
+    t_emb = test_df[[f"A{i:02d}" for i in range(64)]].values
+    c_sims = np.dot(t_emb, c_res['centroid'])
+    c_metrics = calculate_classifier_metrics(c_sims[test_df[class_property] == 1], c_sims)
     
-    try:
-        # Calculate thresholds server-side using percentiles
-        threshold_res = presence_only.reduceColumns(
-            reducer=ee.Reducer.percentile([5, 50]),
-            selectors=[score_col]
-        ).getInfo()
-        
-        t_95tpr = float(threshold_res['p5'])
-        t_median = float(threshold_res['p50'])
+    # Maxent
+    m_data = _prepare_training_data(train_df, nuisance_vars, ecological_vars, class_property, scale=scale)
+    m_clf = ee.Classifier.amnhMaxent(autoFeature=True, outputFormat='cloglog').train(m_data['fc'], m_data['class_property'], m_data['all_predictors'])
+    t_data = _prepare_training_data(test_df, nuisance_vars, ecological_vars, class_property, scale=scale)
+    t_clf = t_data['fc'].classify(m_clf, 'classification')
+    m_sims = np.array(t_clf.aggregate_array('classification').getInfo(), dtype=float)
+    m_metrics = calculate_classifier_metrics(m_sims[np.array(t_clf.aggregate_array(t_data['class_property']).getInfo()) == 1], m_sims)
+    
+    # Ensemble
+    e_sims = c_sims * m_sims
+    e_metrics = calculate_classifier_metrics(e_sims[test_df[class_property] == 1], e_sims)
+    
+    return {'centroid': c_metrics, 'maxent': m_metrics, 'ensemble': e_metrics}
 
-        # Calculate AUC server-side
-        # We use a custom logic for AUC if possible, or pull if small.
-        # Given potential for 10k points, let's try to pull ONLY the score column to minimize payload.
-        # But even better, let's use ee.Classifier.explain() or similar if possible.
-        # Actually, for 10k points, pull of a single column is ~100KB, which is safe.
-        
-        # Pull presence and absence scores separately
-        presence_probs = np.array(presence_only.aggregate_array(score_col).getInfo(), dtype=float)
-        absence_probs = np.array(absence_only.aggregate_array(score_col).getInfo(), dtype=float)
-        
-        if presence_probs.size == 0:
-            raise ValueError(f"No valid scores in '{score_col}' for presence")
-            
-        threshold_95tpr = t_95tpr
-        
-        if absence_probs.size > 0:
-            # We can still calculate balanced threshold locally on the 1D arrays
-            y_scores = np.concatenate([presence_probs, absence_probs])
-            threshold_candidates = np.unique(y_scores)
-            
-            # Efficient local search for balanced threshold
-            # Subsample candidates if too many
-            if len(threshold_candidates) > 500:
-                threshold_candidates = np.percentile(threshold_candidates, np.linspace(0, 100, 500))
-
-            best_t, max_sum = 0, 0
-            for t in threshold_candidates:
-                tpr = np.mean(presence_probs >= t)
-                tnr = np.mean(absence_probs < t)
-                if tpr + tnr >= max_sum:
-                    max_sum = tpr + tnr
-                    best_t = t
-            threshold_balanced = float(best_t)
-            threshold_95tnr = float(np.percentile(absence_probs, 95))
-            
-            # AUC (Wilcoxon-Mann-Whitney)
-            auc = 0
-            for p in presence_probs:
-                auc += np.sum(p > absence_probs)
-                auc += 0.5 * np.sum(p == absence_probs)
-            auc /= (len(presence_probs) * len(absence_probs))
-        else:
-            threshold_95tnr = t_median
-            threshold_balanced = t_median
-            auc = 0.5
-            
-    except Exception as e:
-        sys.stderr.write(f"Warning: performance calculation failed: {e}\n")
-        return {'95tpr': 0.1, '95tnr': 0.9, 'balanced': 0.5, 'auc': 0.0}
-
-    return {
-        '95tpr': threshold_95tpr,
-        '95tnr': threshold_95tnr,
-        'balanced': threshold_balanced,
-        'auc': float(auc),
-        'score_column': score_col
-    }
+def run_parallel_cv(df, nuisance_vars, ecological_vars, class_property='present', scale=10, n_folds=5):
+    from concurrent.futures import ThreadPoolExecutor
+    df_f = assign_spatial_folds(df, n_folds=n_folds)
+    with ThreadPoolExecutor(max_workers=n_folds) as ex:
+        res = [r for r in ex.map(lambda i: run_cv_fold(i, df_f, nuisance_vars, ecological_vars, class_property, scale), range(n_folds)) if r]
+    
+    avg = {}
+    for m in ['centroid', 'maxent', 'ensemble']:
+        avg[m] = {met: float(np.mean([r[m][met] for r in res])) for met in ['cbi', 'auc']}
+    return avg

@@ -26,7 +26,7 @@ def main():
     parser.add_argument("--gcs-bucket", help="GCS bucket name for server-side export (bypasses local download)")
     parser.add_argument("--wait", action="store_true", help="Wait for the export task(s) to complete and show progress updates.")
     parser.add_argument("--zip", action="store_true", help="Zip the output rasters (only for local download mode).")
-    parser.add_argument("--method", choices=["centroid", "rf", "maxent"], default="centroid", help="Mapping method: 'centroid' (presence-only), 'rf' (presence/absence RF), or 'maxent' (Maxent).")
+    parser.add_argument("--method", choices=["centroid", "maxent"], default="centroid", help="Mapping method: 'centroid' (presence-only) or 'maxent' (Maxent).")
     parser.add_argument("--nuisance-vars", help="Comma-separated list of columns to treat as nuisance variables.")
     parser.add_argument("--prefix", help="Prefix for output raster filenames (default: 'prediction_map')")
     parser.add_argument("--only-similarity", action="store_true", help="Only generate/download similarity map (skip masks)")
@@ -66,38 +66,38 @@ def main():
             meta = {
                 "method": "centroid",
                 "centroid": res['centroid'].tolist(),
-                "thresholds": res['thresholds']
+                "metrics": res['metrics']
             }
-        elif args.method in ["rf", "maxent"]:
-            # RF or Maxent Modes - requires GEE for cloud training
+        elif args.method == "maxent":
+            # Maxent Mode - requires GEE for cloud training
             import ee
-            from autoSDM.trainer import train_rf_model, train_maxent_model
+            from autoSDM.trainer import train_maxent_model, run_parallel_cv
             
             # Initialize GEE if not already done
             try:
                 ee.Initialize()
             except Exception:
-                pass  # Already initialized or will fail in trainer
+                pass 
             
             nuisance_vars = args.nuisance_vars.split(',') if args.nuisance_vars else []
             ecological_vars = [f"A{i:02d}" for i in range(64)]
             
-            if args.method == "rf":
-                classifier, nuisance_optima, df_clean, thresholds = train_rf_model(
-                    df=df,
-                    nuisance_vars=nuisance_vars,
-                    ecological_vars=ecological_vars,
-                    key_path=args.key,
-                    scale=args.scale
-                )
-            else:
-                classifier, nuisance_optima, df_clean, thresholds = train_maxent_model(
-                    df=df,
-                    nuisance_vars=nuisance_vars,
-                    ecological_vars=ecological_vars,
-                    key_path=args.key,
-                    scale=args.scale
-                )
+            classifier, nuisance_optima, df_clean, metrics = train_maxent_model(
+                df=df,
+                nuisance_vars=nuisance_vars,
+                ecological_vars=ecological_vars,
+                key_path=args.key,
+                scale=args.scale
+            )
+            
+            # Run Parallel CV
+            sys.stderr.write("Running 5-fold Spatial Block Cross-Validation...\n")
+            cv_results = run_parallel_cv(
+                df=df,
+                nuisance_vars=nuisance_vars,
+                ecological_vars=ecological_vars,
+                scale=args.scale
+            )
             
             # Save cleaned data
             os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
@@ -110,7 +110,8 @@ def main():
                 "nuisance_optima": nuisance_optima,
                 "ecological_vars": ecological_vars,
                 "nuisance_vars": nuisance_vars,
-                "thresholds": thresholds
+                "metrics": metrics,
+                "cv_results": cv_results
             }
 
         if args.output.endswith('.csv'):

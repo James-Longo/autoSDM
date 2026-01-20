@@ -21,11 +21,63 @@ def geometric_median(X, eps=1e-5, max_iter=100):
         y = new_y
     return y
 
+def calculate_cbi(pos_scores, all_scores, window_width=0.1, n_bins=100):
+    """
+    Calculates the Continuous Boyce Index (CBI).
+    Boyce Index is a measure of how much the model predictions differ from 
+    random distribution of presence.
+    """
+    if len(pos_scores) == 0:
+        return 0.0
+    
+    # Define the range of scores
+    min_score = np.min(all_scores)
+    max_score = np.max(all_scores)
+    
+    # Range of evaluation points (centers of moving windows)
+    eval_points = np.linspace(min_score, max_score, n_bins)
+    
+    f_obs = [] # Observed frequency (proportion of presences in window)
+    f_exp = [] # Expected frequency (proportion of total area/background in window)
+    
+    half_width = (max_score - min_score) * window_width / 2
+    
+    for p in eval_points:
+        # Window bounds
+        low = p - half_width
+        high = p + half_width
+        
+        # Count presences in window
+        n_pos = np.sum((pos_scores >= low) & (pos_scores <= high))
+        # Count total background/all points in window
+        n_all = np.sum((all_scores >= low) & (all_scores <= high))
+        
+        # Observed frequency (proportion of presences)
+        f_obs.append(n_pos / len(pos_scores) if len(pos_scores) > 0 else 0)
+        # Expected frequency (proportion of total)
+        f_exp.append(n_all / len(all_scores) if len(all_scores) > 0 else 0)
+    
+    f_obs = np.array(f_obs)
+    f_exp = np.array(f_exp)
+    
+    # Avoid division by zero
+    valid = f_exp > 0
+    if not np.any(valid):
+        return 0.0
+        
+    p_e = f_obs[valid] / f_exp[valid]
+    
+    # CBI is the Spearman rank correlation between P/E and the score (eval_points)
+    from scipy.stats import spearmanr
+    correlation, _ = spearmanr(eval_points[valid], p_e)
+    
+    return float(correlation) if not np.isnan(correlation) else 0.0
+
 def analyze_embeddings(df, class_property='present'):
     """
-    Analyzes embeddings: calculates species centroid, cosine similarity, and 
-    several thresholds (95% TPR, 95% TNR, Balanced) if presence/absence is available.
-    Expects lowercase column name 'present' for presence/absence data.
+    Analyzes embeddings: calculates species centroid, similarity, and 
+    validation metrics (CBI, AUC).
+    Expects lowercase column name 'present' for presence/background data.
     """
     emb_cols = [f"A{i:02d}" for i in range(64)]
     
@@ -64,50 +116,35 @@ def analyze_embeddings(df, class_property='present'):
     similarities = np.dot(df_clean[emb_cols].values, centroid)
     df_clean['similarity'] = similarities
     
-    # Threshold Calculation
+    # Metric Calculation
     res_meta = {
         "centroid": centroid,
         "similarities": similarities,
         "clean_data": df_clean,
-        "thresholds": {}
+        "metrics": {}
     }
     
-    if class_property in df_clean.columns and (df_clean[class_property] == 0).any():
-        # Tuning with Presence/Absence
+    if class_property in df_clean.columns:
         pos_scores = df_clean[df_clean[class_property] == 1]['similarity'].values
         neg_scores = df_clean[df_clean[class_property] == 0]['similarity'].values
         
-        # 95% TPR (5th percentile of presence)
-        res_meta['thresholds']['95tpr'] = float(np.percentile(pos_scores, 5))
+        # CBI (Primary for Presence-Background)
+        res_meta['metrics']['cbi'] = calculate_cbi(pos_scores, similarities)
         
-        # 95% TNR (95th percentile of absence)
-        res_meta['thresholds']['95tnr'] = float(np.percentile(neg_scores, 95))
-        
-        # Balanced (Maximize TPR + TNR)
-        y_scores = df_clean['similarity'].values
-        threshold_candidates = np.unique(y_scores)
-        best_t = 0
-        max_sum = 0
-        for t in threshold_candidates:
-            tpr = np.mean(pos_scores >= t)
-            tnr = np.mean(neg_scores < t)
-            if tpr + tnr > max_sum:
-                max_sum = tpr + tnr
-                best_t = t
-        res_meta['thresholds']['balanced'] = float(best_t)
-        
-        # AUC
-        auc = 0
-        for p in pos_scores:
-            auc += np.sum(p > neg_scores)
-            auc += 0.5 * np.sum(p == neg_scores)
-        auc /= (len(pos_scores) * len(neg_scores))
-        res_meta['thresholds']['auc'] = float(auc)
-        
+        # AUC (Only if "absences" exist)
+        if len(neg_scores) > 0:
+            auc = 0
+            for p in pos_scores:
+                auc += np.sum(p > neg_scores)
+                auc += 0.5 * np.sum(p == neg_scores)
+            auc /= (len(pos_scores) * len(neg_scores))
+            res_meta['metrics']['auc'] = float(auc)
+        else:
+            res_meta['metrics']['auc'] = 0.5
+            
     else:
-        # Fallback for Presence-Only (legacy behavior)
-        res_meta['thresholds']['95tpr'] = float(np.percentile(similarities, 5))
-        res_meta['thresholds']['balanced'] = float(np.percentile(similarities, 50))
-        res_meta['thresholds']['auc'] = 0.5
+        # Fallback for Presence-Only
+        res_meta['metrics']['cbi'] = calculate_cbi(similarities, similarities)
+        res_meta['metrics']['auc'] = 0.5
 
     return res_meta
