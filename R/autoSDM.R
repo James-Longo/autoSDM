@@ -11,9 +11,10 @@
 #' @param background_method Optional. Method to generate background points if presence-only data is provided. Defaults to "sample_extent". Options: "sample_extent", "buffer".
 #' @param background_buffer Optional. Numeric vector of length 2: c(min_dist, max_dist) in meters for buffer-based sampling.
 #' @param python_path Optional. Path to Python executable. Auto-detected if not provided.
+#' @param cv Optional. Boolean whether to run 5-fold Spatial Block Cross-Validation. Defaults to FALSE.
 #' @return A list containing model metadata, performance metrics, and paths to the generated maps.
 #' @export
-autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_method = "sample_extent", background_buffer = NULL, python_path = NULL) {
+autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_method = "sample_extent", background_buffer = NULL, python_path = NULL, cv = FALSE) {
   # 1. Validate standardized column names
   required_cols <- c("longitude", "latitude", "year")
   missing <- setdiff(required_cols, names(data))
@@ -103,10 +104,10 @@ autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_meth
 
   # 8. Step 2 & 3: Multi-Model Analysis
   message("--- Step 2: Running Centroid Analysis ---")
-  res_centroid <- analyze_embeddings(data_with_emb, method = "centroid", python_path = python_path)
+  res_centroid <- analyze_embeddings(data_with_emb, method = "centroid", python_path = python_path, cv = cv)
 
   message("--- Step 3: Running Maxent Analysis ---")
-  res_maxent <- analyze_embeddings(data_with_emb, method = "maxent", nuisance_vars = nuisance_vars, python_path = python_path)
+  res_maxent <- analyze_embeddings(data_with_emb, method = "maxent", nuisance_vars = nuisance_vars, python_path = python_path, cv = cv)
 
   # 9. Step 4: Ensemble Extrapolation
   message("--- Step 4: Generating Ensemble Extrapolation Map ---")
@@ -142,9 +143,10 @@ autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_meth
 
   # Run the models to save the meta files permanently in output_dir
   nuisance_arg <- if (length(nuisance_vars) > 0) c("--nuisance-vars", paste(nuisance_vars, collapse = ",")) else NULL
+  cv_arg <- if (cv) "--cv" else NULL
 
-  system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(centroid_meta), "--method", "centroid"))
-  system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(maxent_meta), "--method", "maxent", nuisance_arg))
+  system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(centroid_meta), "--method", "centroid", cv_arg))
+  system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(maxent_meta), "--method", "maxent", nuisance_arg, cv_arg))
 
   # Run ensemble
   status <- system2(python_path, args = args, stdout = "", stderr = "")

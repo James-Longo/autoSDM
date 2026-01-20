@@ -36,6 +36,7 @@ def main():
     
     parser.add_argument("--background-method", choices=["sample_extent", "buffer"], help="Method to generate background points if presence-only data is provided.")
     parser.add_argument("--background-buffer", nargs=2, type=float, help="Min and Max distance (in meters) for buffer-based background sampling. e.g. --background-buffer 100 1000")
+    parser.add_argument("--cv", action="store_true", help="Run 5-fold Spatial Block Cross-Validation.")
     
     args = parser.parse_args()
     
@@ -66,8 +67,23 @@ def main():
             meta = {
                 "method": "centroid",
                 "centroid": res['centroid'].tolist(),
-                "metrics": res['metrics']
+                "metrics": res['metrics'],
+                "cv_results": None
             }
+            
+            if args.cv:
+                from autoSDM.trainer import run_parallel_cv
+                import ee
+                try: ee.Initialize()
+                except: pass
+                
+                sys.stderr.write("Running 5-fold Spatial Block Cross-Validation (Centroid)...\n")
+                meta["cv_results"] = run_parallel_cv(
+                    df=df,
+                    nuisance_vars=[],
+                    ecological_vars=[f"A{i:02d}" for i in range(64)],
+                    scale=args.scale
+                )
         elif args.method == "maxent":
             # Maxent Mode - requires GEE for cloud training
             import ee
@@ -90,14 +106,16 @@ def main():
                 scale=args.scale
             )
             
-            # Run Parallel CV
-            sys.stderr.write("Running 5-fold Spatial Block Cross-Validation...\n")
-            cv_results = run_parallel_cv(
-                df=df,
-                nuisance_vars=nuisance_vars,
-                ecological_vars=ecological_vars,
-                scale=args.scale
-            )
+            # Run Parallel CV if requested
+            cv_results = None
+            if args.cv:
+                sys.stderr.write("Running 5-fold Spatial Block Cross-Validation...\n")
+                cv_results = run_parallel_cv(
+                    df=df,
+                    nuisance_vars=nuisance_vars,
+                    ecological_vars=ecological_vars,
+                    scale=args.scale
+                )
             
             # Save cleaned data
             os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
