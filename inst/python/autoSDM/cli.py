@@ -34,12 +34,20 @@ def main():
     parser.add_argument("--lon", type=float, help="Longitude for AOI center")
     parser.add_argument("--radius", type=float, help="Radius (in meters) for AOI")
     
+    parser.add_argument("--background-method", choices=["sample_extent", "buffer"], help="Method to generate background points if presence-only data is provided.")
+    parser.add_argument("--background-buffer", nargs=2, type=float, help="Min and Max distance (in meters) for buffer-based background sampling. e.g. --background-buffer 100 1000")
+    
     args = parser.parse_args()
     
     if args.mode == "extract":
         df = pd.read_csv(args.input)
         extractor = GEEExtractor(args.key)
-        res = extractor.extract_embeddings(df, scale=args.scale)
+        res = extractor.extract_embeddings(
+            df, 
+            scale=args.scale, 
+            background_method=args.background_method,
+            background_buffer=args.background_buffer
+        )
         os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
         res.to_csv(args.output, index=False)
         sys.stderr.write(f"Extraction complete at {args.scale}m. Results saved to {args.output}\n")

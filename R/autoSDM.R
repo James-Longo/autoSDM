@@ -8,10 +8,12 @@
 #' @param aoi Mandatory. Either a list with `lat`, `lon`, and `radius` (in meters), or a character string path to a polygon file (GeoJSON or Shapefile).
 #' @param output_dir Optional. Directory to save results. Defaults to the current working directory.
 #' @param scale Optional. Resolution in meters for the final map. Defaults to 10.
+#' @param background_method Optional. Method to generate background points if presence-only data is provided. Defaults to "sample_extent". Options: "sample_extent", "buffer".
+#' @param background_buffer Optional. Numeric vector of length 2: c(min_dist, max_dist) in meters for buffer-based sampling.
 #' @param python_path Optional. Path to Python executable. Auto-detected if not provided.
 #' @return A list containing model metadata, performance metrics, and paths to the generated maps.
 #' @export
-autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, python_path = NULL) {
+autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_method = "sample_extent", background_buffer = NULL, python_path = NULL) {
   # 1. Validate standardized column names
   required_cols <- c("longitude", "latitude", "year")
   missing <- setdiff(required_cols, names(data))
@@ -43,13 +45,12 @@ autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, python_path = N
   ensure_autoSDM_dependencies(python_path)
 
   # Locate the python source directory (inst/python)
-  pkg_py_path <- system.file("python", package = "autoSDM")
-
-  # Fallback for local development (if package not installed but loaded)
-  if (pkg_py_path == "") {
-    if (file.exists(file.path(getwd(), "inst", "python"))) {
-      pkg_py_path <- file.path(getwd(), "inst", "python")
-    }
+  # Prioritize local development path
+  pkg_py_path <- ""
+  if (file.exists(file.path(getwd(), "inst", "python"))) {
+    pkg_py_path <- file.path(getwd(), "inst", "python")
+  } else {
+    pkg_py_path <- system.file("python", package = "autoSDM")
   }
 
   if (pkg_py_path != "") {
@@ -91,7 +92,13 @@ autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, python_path = N
 
   # 7. Step 1: Extract Embeddings
   message("--- Step 1: Extracting Alpha Earth Embeddings ---")
-  data_with_emb <- extract_embeddings(data, scale = scale, python_path = python_path)
+  data_with_emb <- extract_embeddings(
+    data,
+    scale = scale,
+    python_path = python_path,
+    background_method = background_method,
+    background_buffer = background_buffer
+  )
   vroom::vroom_write(data_with_emb, extract_csv, delim = ",")
 
   # 8. Step 2 & 3: Multi-Model Analysis

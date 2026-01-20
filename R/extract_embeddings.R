@@ -21,13 +21,11 @@ ee_auth_service <- function(json_path = Sys.getenv("GEE_SERVICE_ACCOUNT_KEY"), v
   message("GEE credentials set for system calls.")
 }
 
-#' Extract Alpha Earth Embeddings
-#'
-#' @param df A data frame with Latitude, Longitude, and Year.
-#' @param scale Resolution in meters. Defaults to 10.
+#' @param background_method Optional. Method to generate background points ("sample_extent" or "buffer").
+#' @param background_buffer Optional. Numeric vector of length 2: c(min_dist, max_dist).
 #' @return A data frame with added A00-A63 embedding columns.
 #' @keywords internal
-extract_embeddings <- function(df, scale = 10, python_path = NULL) {
+extract_embeddings <- function(df, scale = 10, python_path = NULL, background_method = NULL, background_buffer = NULL) {
   python_path <- resolve_python_path(python_path)
 
   if (is.null(python_path)) {
@@ -47,6 +45,17 @@ extract_embeddings <- function(df, scale = 10, python_path = NULL) {
     "--output", shQuote(tmp_out),
     "--scale", scale
   )
+
+  if (!is.null(background_method)) {
+    args <- c(args, "--background-method", background_method)
+  }
+
+  if (!is.null(background_buffer)) {
+    if (length(background_buffer) != 2) {
+      stop("background_buffer must be a numeric vector of length 2: c(min_dist, max_dist)")
+    }
+    args <- c(args, "--background-buffer", background_buffer[1], background_buffer[2])
+  }
 
   if (exists("sa_json_key") && !is.null(sa_json_key) && sa_json_key != "") {
     args <- c(args, "--key", shQuote(sa_json_key))
