@@ -149,7 +149,7 @@ def calculate_classifier_performance(classifier, fc, class_property):
     
     # 1. Inspect one feature to find score column name
     # Explicitly select only properties we might need to minimize payload
-    sample = classified.first().select(['classification', 'probability', class_property]).getInfo()
+    sample = ee.Feature(classified.first()).select(['classification', 'probability', class_property]).getInfo()
     if not sample:
         sys.stderr.write("Warning: Classified collection is empty.\n")
         return {'95tpr': 0.1, '95tnr': 0.9, 'balanced': 0.5, 'auc': 0.0}

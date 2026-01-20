@@ -61,57 +61,55 @@ class GEEExtractor:
             return pd.DataFrame()
 
         years = sorted(df['year'].unique())
-        all_results = []
+        all_yearly_fcs = []
         
+        sys.stderr.write(f"Preparing sampling requests for {len(years)} years...\n")
         for yr in years:
             yr_df = df[df['year'] == yr].copy()
-            sys.stderr.write(f"Processing {len(yr_df)} points for year {int(yr)} at scale {scale}m...\n")
             
             img = ee.ImageCollection(asset_path)\
                 .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))\
                 .mosaic()
             
-            CHUNK_SIZE = 4000
             features = []
             for idx, row in yr_df.iterrows():
                 geom = ee.Geometry.Point([row['longitude'], row['latitude']])
                 feat = ee.Feature(geom, {'orig_index': str(idx)})
                 features.append(feat)
             
-            for i in range(0, len(features), CHUNK_SIZE):
-                chunk = features[i:i + CHUNK_SIZE]
-                fc = ee.FeatureCollection(chunk)
-                
-                sampled = img.reduceRegions(
-                    collection=fc,
-                    reducer=ee.Reducer.mean(),
-                    scale=scale
-                )
-                
-                try:
-                    res = sampled.getInfo()
-                    found_any = False
-                    
-                    for feat in res['features']:
-                        props = feat['properties']
-                        if 'A00' in props and props['A00'] is not None:
-                            idx = int(props.pop('orig_index'))
-                            for k, v in props.items():
-                                yr_df.at[idx, k] = v
-                            found_any = True
-                    
-                    if not found_any:
-                        sys.stderr.write(f"Warning: No valid embeddings found for {int(yr)} chunk {i//CHUNK_SIZE}\n")
-                        
-                except Exception as e:
-                    sys.stderr.write(f"Error during GEE sampling for {int(yr)} chunk {i//CHUNK_SIZE}: {str(e)}\n")
+            fc = ee.FeatureCollection(features)
+            sampled = img.reduceRegions(
+                collection=fc,
+                reducer=ee.Reducer.mean(),
+                scale=scale
+            )
+            all_yearly_fcs.append(sampled)
             
-            all_results.append(yr_df)
-            
-        if not all_results:
-            return pd.DataFrame()
+        # Merge all years into one collection
+        total_fc = ee.FeatureCollection(all_yearly_fcs).flatten()
         
-        return pd.concat(all_results)
+        # Retrieve in chunks to avoid GEE limits
+        chunk_size = 4000
+        total_count = len(df)
+        total_list = total_fc.toList(total_count)
+        
+        sys.stderr.write(f"Retrieving embeddings for {total_count} points in {len(years)} years...\n")
+        
+        for i in range(0, total_count, chunk_size):
+            sys.stderr.write(f"Retrieving embedding chunk {i//chunk_size + 1}...\n")
+            chunk = ee.List(total_list.slice(i, i + chunk_size))
+            try:
+                res = chunk.getInfo()
+                for feat in res:
+                    props = feat['properties']
+                    if 'A00' in props and props['A00'] is not None:
+                        idx = int(props.pop('orig_index'))
+                        for k, v in props.items():
+                            df.at[idx, k] = v
+            except Exception as e:
+                sys.stderr.write(f"Error during GEE retrieval for chunk {i//chunk_size + 1}: {str(e)}\n")
+        
+        return df
 
     def generate_background_points(self, presence_df, method="sample_extent", buffer_params=None, scale=10):
         """
