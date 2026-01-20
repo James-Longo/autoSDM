@@ -10,11 +10,11 @@ ensure_autoSDM_dependencies <- function(python_path) {
         stop("Invalid python path provided to dependency checker.")
     }
 
-    required_pkgs <- c("earthengine-api", "pandas", "numpy", "geopandas", "shapely")
+    required_pkgs <- c("earthengine-api", "pandas", "numpy", "geopandas", "shapely", "scipy")
 
     # Check import - use simple import test for each package
     # earthengine-api imports as 'ee', others import as their package name
-    import_names <- c("ee", "pandas", "numpy", "geopandas", "shapely")
+    import_names <- c("ee", "pandas", "numpy", "geopandas", "shapely", "scipy")
 
     check_code <- paste0(
         "try:\n",

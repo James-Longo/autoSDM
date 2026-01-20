@@ -9,7 +9,8 @@ setup(
         "pandas",
         "numpy",
         "geopandas",
-        "shapely"
+        "shapely",
+        "scipy"
     ],
     entry_points={
         "console_scripts": [
