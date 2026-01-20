@@ -144,38 +144,45 @@ def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='p
             optimum = float((bin_edges[max_idx] + bin_edges[max_idx+1]) / 2)
         nuisance_optima[var] = optimum
     
-    # 6. Create FeatureCollection on Server (minimal payload)
-    # We send coordinates and nuisance variables only. 
-    # Alpha Earth embeddings (A00-A63) are sampled server-side to avoid 10MB payload limit.
-    years = sorted(df_clean['year'].unique())
-    asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
+    # 6. Create FeatureCollection on Server
+    # If embeddings (A00-A63) already exist in df, upload them to avoid expensive re-sampling.
+    has_embeddings = all(f"A{i:02d}" in df_clean.columns for i in range(64))
     
-    base_fcs = []
-    for yr in years:
-        yr_df = df_clean[df_clean['year'] == yr]
+    if has_embeddings:
+        sys.stderr.write("Using pre-extracted embeddings for model training (skipping GEE sampling).\n")
         features = []
-        for _, row in yr_df.iterrows():
-            props = {col: float(row[col]) for col in nuisance_vars + [class_property]}
+        for _, row in df_clean.iterrows():
+            props = {col: float(row[col]) for col in all_predictors + [class_property]}
             geom = ee.Geometry.Point([row['longitude'], row['latitude']])
             features.append(ee.Feature(geom, props))
+        fc = ee.FeatureCollection(features)
+    else:
+        sys.stderr.write("Sampling embeddings from Google Earth Engine...\n")
+        years = sorted(df_clean['year'].unique())
+        asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
         
-        yr_fc = ee.FeatureCollection(features)
-        
-        # Sample embeddings server-side for this year
-        year_img = ee.ImageCollection(asset_path).filter(ee.Filter.calendarRange(int(yr), int(yr), 'year')).mosaic()
-        sampled_yr_fc = year_img.reduceRegions(
-            collection=yr_fc,
-            reducer=ee.Reducer.mean(),
-            scale=scale
-        ).filter(ee.Filter.notNull(['A00']))
-        
-        # Debug: check size per year
-        yr_size = int(sampled_yr_fc.size().getInfo())
-        sys.stderr.write(f"Year {yr}: {len(features)} points -> {yr_size} valid samples.\n")
-        
-        base_fcs.append(sampled_yr_fc)
+        base_fcs = []
+        for yr in years:
+            yr_df = df_clean[df_clean['year'] == yr]
+            features = []
+            for _, row in yr_df.iterrows():
+                props = {col: float(row[col]) for col in nuisance_vars + [class_property]}
+                geom = ee.Geometry.Point([row['longitude'], row['latitude']])
+                features.append(ee.Feature(geom, props))
+            
+            yr_fc = ee.FeatureCollection(features)
+            
+            # Sample embeddings server-side for this year
+            year_img = ee.ImageCollection(asset_path).filter(ee.Filter.calendarRange(int(yr), int(yr), 'year')).mosaic()
+            sampled_yr_fc = year_img.reduceRegions(
+                collection=yr_fc,
+                reducer=ee.Reducer.mean(),
+                scale=scale
+            ).filter(ee.Filter.notNull(['A00']))
+            
+            base_fcs.append(sampled_yr_fc)
+        fc = ee.FeatureCollection(base_fcs).flatten()
 
-    fc = ee.FeatureCollection(base_fcs).flatten()
     total_samples = int(fc.size().getInfo())
     sys.stderr.write(f"Total training FeatureCollection size: {total_samples}\n")
 
@@ -324,16 +331,22 @@ def run_cv_fold(fold_idx, df, nuisance_vars, ecological_vars, class_property, sc
     return {'centroid': c_metrics, 'maxent': m_metrics, 'ensemble': e_metrics}
 
 def run_parallel_cv(df, nuisance_vars, ecological_vars, class_property='present', scale=10, n_folds=5):
-    from concurrent.futures import ThreadPoolExecutor
     df_f = assign_spatial_folds(df, n_folds=n_folds)
     
-    # Reduced max_workers to 2 to avoid "Too many concurrent aggregations"
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        res = [r for r in ex.map(lambda i: run_cv_fold(i, df_f, nuisance_vars, ecological_vars, class_property, scale), range(n_folds)) if r]
+    # Sequential execution is now much more stable for GEE and fast enough
+    # since we avoid re-sampling imagery if embeddings are already present.
+    res = []
+    for i in range(n_folds):
+        sys.stderr.write(f"Processing 5-fold CV: Fold {i+1}/{n_folds}...\n")
+        fold_res = run_cv_fold(i, df_f, nuisance_vars, ecological_vars, class_property, scale)
+        if fold_res:
+            res.append(fold_res)
     
     if not res:
         sys.stderr.write("Warning: All CV folds failed or returned no data.\n")
         return {m: {'cbi': 0.0, 'auc': 0.5} for m in ['centroid', 'maxent', 'ensemble']}
+    
+    avg = {}
     for m in ['centroid', 'maxent', 'ensemble']:
         avg[m] = {met: float(np.mean([r[m][met] for r in res])) for met in ['cbi', 'auc']}
     return avg
