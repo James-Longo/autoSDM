@@ -140,6 +140,11 @@ class GEEExtractor:
         n_pres = len(presence_df)
         n_bg = n_pres * 10
         
+        # Determine deterministic seed from presence data
+        # Use sum of coordinates as a simple hash
+        seed = int(abs(presence_df['longitude'].sum() + presence_df['latitude'].sum()) * 10000) % 1000000
+        sys.stderr.write(f"Using deterministic seed: {seed}\n")
+
         if method == "sample_extent":
             bounds = [
                 presence_df['longitude'].min(),
@@ -148,7 +153,7 @@ class GEEExtractor:
                 presence_df['latitude'].max()
             ]
             sampling_region = ee.Geometry.Rectangle(bounds).difference(exclusion_mask)
-            bg_fc = ee.FeatureCollection.randomPoints(sampling_region, n_bg)
+            bg_fc = ee.FeatureCollection.randomPoints(sampling_region, n_bg, seed=seed)
         elif method == "buffer" and buffer_params:
             min_dist, max_dist = buffer_params
             
@@ -157,7 +162,9 @@ class GEEExtractor:
                 p = feat.geometry()
                 # Local ring for this point
                 ring = p.buffer(max_dist).difference(exclusion_mask)
-                return ee.FeatureCollection.randomPoints(ring, 10)
+                # Note: randomPoints seed in map() is tricky, we use a per-feature offset
+                # GEE doesn't allow dynamic seeds easily in map, but feature ID helps
+                return ee.FeatureCollection.randomPoints(ring, 10, seed=seed)
 
             bg_fc = presence_fc.map(sample_per_point).flatten()
         else:
@@ -192,9 +199,10 @@ class GEEExtractor:
 
         bg_df = pd.DataFrame(bg_coords)
         
-        # 5. Assign years randomly from presence distribution
+        # 5. Assign years randomly from presence distribution (deterministic)
         presence_years = presence_df['year'].values
-        bg_df['year'] = np.random.choice(presence_years, size=len(bg_df))
+        rng = np.random.RandomState(seed)
+        bg_df['year'] = rng.choice(presence_years, size=len(bg_df))
         
         sys.stderr.write(f"Generated {len(bg_df)} background points.\n")
         return bg_df

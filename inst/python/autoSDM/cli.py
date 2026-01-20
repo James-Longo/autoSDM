@@ -87,14 +87,16 @@ def main():
                     df=df,
                     nuisance_vars=nuisance_vars,
                     ecological_vars=ecological_vars,
-                    key_path=args.key
+                    key_path=args.key,
+                    scale=args.scale
                 )
             else:
                 classifier, nuisance_optima, df_clean, thresholds = train_maxent_model(
                     df=df,
                     nuisance_vars=nuisance_vars,
                     ecological_vars=ecological_vars,
-                    key_path=args.key
+                    key_path=args.key,
+                    scale=args.scale
                 )
             
             # Save cleaned data
