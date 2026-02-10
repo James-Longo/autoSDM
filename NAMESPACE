@@ -1,2 +1,5 @@
-export(autoSDM)
-export(format_data)
+exportPattern("^[[:alpha:]]+")
+import(reticulate)
+import(vroom)
+import(jsonlite)
+import(ggplot2)

@@ -1,62 +1,109 @@
-#' Ensure autoSDM Python Dependencies
+#' Install autoSDM Python Dependencies
 #'
-#' Checks if required Python packages are installed in the given Python environment.
-#' If missing, attempts to install them automatically.
+#' This function creates a dedicated Python virtual environment for autoSDM and
+#' installs all required Python dependencies (earthengine-api, pandas, etc.).
 #'
-#' @param python_path Path to the python executable.
-#' @keywords internal
-ensure_autoSDM_dependencies <- function(python_path) {
-    if (is.null(python_path) || !file.exists(python_path)) {
-        stop("Invalid python path provided to dependency checker.")
+#' @param envname Name of the virtual environment. Defaults to "r-autoSDM".
+#' @param restart_session Whether to restart the R session after installation. Defaults to TRUE in interactive sessions.
+#' @export
+install_autoSDM <- function(envname = "r-autoSDM", restart_session = interactive()) {
+    if (!requireNamespace("reticulate", quietly = TRUE)) {
+        stop("The 'reticulate' package is required to manage Python dependencies.")
     }
 
     required_pkgs <- c("earthengine-api", "pandas", "numpy", "geopandas", "shapely", "scipy")
 
-    # Check import - use simple import test for each package
-    # earthengine-api imports as 'ee', others import as their package name
-    import_names <- c("ee", "pandas", "numpy", "geopandas", "shapely", "scipy")
+    message("Creating dedicated virtual environment: ", envname)
 
-    check_code <- paste0(
-        "try:\n",
-        paste0("    import ", import_names, collapse = "\n"),
-        "\n    print('OK')\nexcept: exit(1)"
-    )
+    # Create virtualenv if it doesn't exist
+    if (!reticulate::virtualenv_exists(envname)) {
+        tryCatch(
+            {
+                reticulate::virtualenv_create(envname)
+            },
+            error = function(e) {
+                # Fallback to system python if default fails
+                system_python <- Sys.which("python3")
+                if (system_python == "") system_python <- Sys.which("python")
+                reticulate::virtualenv_create(envname, python = system_python)
+            }
+        )
+    }
 
-    status <- system2(python_path, args = c("-c", shQuote(check_code)), stdout = FALSE, stderr = FALSE)
+    message("Installing Python dependencies...")
+    reticulate::virtualenv_install(envname, packages = required_pkgs)
 
-    if (status != 0) {
-        message("Missing required Python dependencies. Installing now... (This may take a moment)")
+    message("\nSuccess! Python dependencies installed in virtualenv: ", envname)
 
-        # We assume pip is available as -m pip.
-        install_args <- c("-m", "pip", "install", required_pkgs, "--quiet", "--upgrade")
-
-        install_status <- system2(python_path, args = install_args)
-
-        if (install_status != 0) {
-            stop("Failed to automatically install dependencies. Please install 'earthengine-api', 'pandas', 'geopandas', 'shapely' manually in your python environment.")
-        }
-        message("Dependencies installed successfully.")
+    if (restart_session) {
+        message("Please restart your R session to use the new environment.")
     }
 }
 
-#' Resolve Python Path
-#'
-#' Helper to find the Python executable using multiple fallback methods:
-#' 1. Explicit argument
-#' 2. Reticulate active/discovered configuration
-#' 3. System PATH (python3, python)
-#' 4. Legacy global variable (py_venv_path)
-#'
-#' @param path Optional explicit path.
-#' @return Path to python executable or NULL.
+#' Ensure autoSDM Python Dependencies (Internal)
+#' @keywords internal
+ensure_autoSDM_dependencies <- function(python_path = NULL) {
+    env_name <- "r-autoSDM"
+    required_pkgs <- c("earthengine-api", "pandas", "numpy", "geopandas", "shapely", "scipy")
+    import_names <- c("ee", "pandas", "numpy", "geopandas", "shapely", "scipy")
+
+    # 1. If user provided a path, try to use it
+    if (!is.null(python_path)) {
+        reticulate::use_python(python_path, required = TRUE)
+    } else if (reticulate::virtualenv_exists(env_name)) {
+        # 2. Otherwise, prefer our dedicated venv
+        reticulate::use_virtualenv(env_name, required = TRUE)
+        python_path <- reticulate::virtualenv_python(env_name)
+    }
+
+    # 3. Check if we can import the core modules
+    message("Checking Python dependencies...")
+    status <- tryCatch(
+        {
+            for (pkg in import_names) {
+                reticulate::import(pkg)
+            }
+            TRUE
+        },
+        error = function(e) FALSE
+    )
+
+    if (!status) {
+        message("\n[autoSDM] Python dependencies are missing or the environment is broken.")
+
+        if (interactive()) {
+            confirm <- utils::askYesNo("Would you like to automatically create a dedicated Python environment for autoSDM?")
+            if (!isTRUE(confirm)) {
+                stop("Python dependencies missing. Please run `autoSDM::install_autoSDM()` to set up your environment.")
+            }
+        } else {
+            message("Non-interactive session detected. Automatically setting up dedicated Python environment...")
+        }
+
+        install_autoSDM(envname = env_name, restart_session = FALSE)
+        reticulate::use_virtualenv(env_name, required = TRUE)
+        return(reticulate::virtualenv_python(env_name))
+    }
+
+    return(python_path)
+}
+
+#' Resolve Python Path (Internal)
 #' @keywords internal
 resolve_python_path <- function(path = NULL) {
+    env_name <- "r-autoSDM"
+
+    # 0. Check for our dedicated venv first
+    if (reticulate::virtualenv_exists(env_name)) {
+        return(reticulate::virtualenv_python(env_name))
+    }
+
     # 1. Explicit argument
     if (!is.null(path) && file.exists(path)) {
         return(path)
     }
 
-    # 2. Try reticulate's py_config (active python)
+    # 2. Try reticulate configuration
     path <- tryCatch(
         {
             cfg <- reticulate::py_config()
@@ -68,19 +115,7 @@ resolve_python_path <- function(path = NULL) {
         return(path)
     }
 
-    # 3. Try reticulate's py_discover_config (find any python)
-    path <- tryCatch(
-        {
-            cfg <- reticulate::py_discover_config()
-            if (!is.null(cfg$python) && file.exists(cfg$python)) cfg$python else NULL
-        },
-        error = function(e) NULL
-    )
-    if (!is.null(path)) {
-        return(path)
-    }
-
-    # 4. Try system PATH - look for python3 or python
+    # 3. System fallback
     for (cmd in c("python3", "python")) {
         sys_python <- Sys.which(cmd)
         if (sys_python != "" && file.exists(sys_python)) {
@@ -88,19 +123,38 @@ resolve_python_path <- function(path = NULL) {
         }
     }
 
-    # 5. Legacy global variable fallback
-    if (exists("py_venv_path", envir = .GlobalEnv)) {
-        venv <- get("py_venv_path", envir = .GlobalEnv)
-        candidate <- file.path(venv, "Scripts", "python.exe")
-        if (file.exists(candidate)) {
-            return(candidate)
-        }
-
-        candidate <- file.path(venv, "bin", "python")
-        if (file.exists(candidate)) {
-            return(candidate)
-        }
-    }
-
     return(NULL)
+}
+
+#' Ensure Google Earth Engine is Authenticated
+#' @keywords internal
+ensure_gee_authenticated <- function(python_path) {
+    message("Checking Google Earth Engine authentication...")
+
+    ee <- reticulate::import("ee", delay_load = FALSE)
+
+    # Try to initialize
+    tryCatch(
+        {
+            ee$Initialize()
+            return(TRUE)
+        },
+        error = function(e) {
+            message("\n[autoSDM] Google Earth Engine authentication is missing or expired.")
+
+            if (interactive()) {
+                confirm <- utils::askYesNo("Would you like to open a browser to authenticate Google Earth Engine now?")
+                if (!isTRUE(confirm)) {
+                    stop("GEE authentication is required to extract satellite embeddings.")
+                }
+            }
+
+            message("Opening browser for GEE authentication...")
+            ee$Authenticate()
+
+            # Try initializing again after authentication
+            ee$Initialize()
+            return(TRUE)
+        }
+    )
 }
