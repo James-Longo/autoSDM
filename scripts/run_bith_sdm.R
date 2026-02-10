@@ -1,4 +1,5 @@
-devtools::install_github("James-Longo/autoSDM", dependencies = TRUE)
+# devtools::install_github("James-Longo/autoSDM", dependencies = TRUE)
+
 
 library(autoSDM)
 
@@ -27,6 +28,9 @@ formatted_data <- format_data(
 aoi <- list(lat = 18.5, lon = -71.2, radius = 1000000)
 
 # 3. Run autoSDM pipeline
+# The pipeline will now auto-discover your GEE project or prompt you with a menu
+# if you have multiple. You no longer need to provide it manually!
+
 # We'll run at 100m first to be sure it works, then 10m if requested?
 # User wants a range map, 100m is usually sufficient for a general range map.
 # But README says 10m-resolution mapping capabilities.

@@ -13,7 +13,7 @@
 #' @param zip Logical. If TRUE, zips the output rasters into a single archive (local mode only).
 #' @return A list containing the paths to the generated map files, HTML, or GCS export details.
 #' @keywords internal
-extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10, coarse_meta_path = NULL, view = FALSE, gcs_bucket = NULL, wait = FALSE, zip = FALSE, python_path = NULL) {
+extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10, coarse_meta_path = NULL, view = FALSE, gcs_bucket = NULL, wait = FALSE, zip = FALSE, python_path = NULL, gee_project = NULL) {
   # Resolve python path using the centralized helper
   py_exe <- resolve_python_path(python_path)
 
@@ -28,10 +28,6 @@ extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10
   # Define output JSON path in the requested directory
   output_json <- file.path(output_dir, paste0("extrapolation_results_", scale, "m.json"))
 
-  if (!exists("sa_json_key")) {
-    sa_json_key <- Sys.getenv("GEE_SERVICE_ACCOUNT_KEY")
-  }
-
   message("Calling Python extrapolation logic at scale ", scale, "m...")
   args <- c(
     "-m", "autoSDM.cli", "extrapolate",
@@ -40,6 +36,11 @@ extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10
     "--meta", shQuote(analysis_meta_path),
     "--scale", scale
   )
+
+  if (!is.null(gee_project) && gee_project != "") {
+    args <- c(args, "--project", shQuote(gee_project))
+  }
+
 
   if (exists("sa_json_key") && !is.null(sa_json_key) && sa_json_key != "") {
     args <- c(args, "--key", shQuote(sa_json_key))

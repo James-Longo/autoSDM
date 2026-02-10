@@ -5,7 +5,7 @@ import sys
 import ee
 
 class GEEExtractor:
-    def __init__(self, json_key_path=None):
+    def __init__(self, json_key_path=None, project=None):
         if not json_key_path:
             json_key_path = os.environ.get("GEE_SERVICE_ACCOUNT_KEY")
         
@@ -13,19 +13,23 @@ class GEEExtractor:
             with open(json_key_path) as f:
                 key_data = json.load(f)
                 self.sa_email = key_data["client_email"]
+                # Try to pick up project from key if not provided
+                if not project:
+                    project = key_data.get("project_id")
             
             credentials = ee.ServiceAccountCredentials(self.sa_email, json_key_path)
-            ee.Initialize(credentials)
-            sys.stderr.write(f"Initialized GEE with service account: {self.sa_email}\n")
+            ee.Initialize(credentials, project=project)
+            sys.stderr.write(f"Initialized GEE with service account: {self.sa_email} (Project: {project})\n")
         else:
             # Attempt to use session auth if no key is provided
             try:
-                ee.Initialize()
-                sys.stderr.write("Initialized GEE using default session credentials.\n")
+                ee.Initialize(project=project)
+                sys.stderr.write(f"Initialized GEE using default session credentials (Project: {project}).\n")
             except Exception as e:
                 sys.stderr.write(f"GEE Initialization failed: {e}\n")
                 sys.stderr.write("Please run 'earthengine authenticate' or provide a service account key.\n")
                 raise
+
 
     def extract_embeddings(self, df, scale=10, background_method=None, background_buffer=None):
         """

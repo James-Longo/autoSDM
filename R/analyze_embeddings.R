@@ -7,7 +7,7 @@
 #' @param nuisance_vars Character vector of columns to treat as nuisance variables.
 #' @return A list containing the results.
 #' @keywords internal
-analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, python_path = NULL, cv = FALSE) {
+analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, python_path = NULL, gee_project = NULL, cv = FALSE) {
   python_path <- resolve_python_path(python_path)
 
   if (is.null(python_path)) {
@@ -27,6 +27,11 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, py
     "--output", shQuote(tmp_out),
     "--method", method
   )
+
+  if (!is.null(gee_project) && gee_project != "") {
+    args <- c(args, "--project", shQuote(gee_project))
+  }
+
 
   if (!is.null(nuisance_vars) && length(nuisance_vars) > 0) {
     args <- c(args, "--nuisance-vars", paste(nuisance_vars, collapse = ","))

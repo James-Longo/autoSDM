@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--key", help="Optional GEE service account key path. If not provided, uses existing session auth.")
+    parser.add_argument("--project", help="Google Cloud Project ID for Earth Engine initialization.")
     parser.add_argument("--aoi-path", help="Path to GeoJSON or Shapefile (polygon) for mapping extent.")
     parser.add_argument("--meta", help="Path to meta JSON (for extrapolate/ensemble mode)")
     parser.add_argument("--meta2", help="Path to second meta JSON (for ensemble mode)")
@@ -42,7 +43,7 @@ def main():
     
     if args.mode == "extract":
         df = pd.read_csv(args.input)
-        extractor = GEEExtractor(args.key)
+        extractor = GEEExtractor(args.key, project=args.project)
         res = extractor.extract_embeddings(
             df, 
             scale=args.scale, 
@@ -55,8 +56,14 @@ def main():
         
     elif args.mode == "analyze":
         df = pd.read_csv(args.input)
-        
+        import ee
+        try:
+            ee.Initialize(project=args.project) if args.project else ee.Initialize()
+        except Exception:
+            pass
+
         if args.method == "centroid":
+
             res = analyze_embeddings(df)
             # Save similarities
             res['clean_data']['similarity'] = res['similarities']
@@ -148,7 +155,8 @@ def main():
             
         df = pd.read_csv(args.input)
         from autoSDM.extrapolate import get_prediction_image
-        extractor = GEEExtractor(args.key) # Initialize GEE
+        extractor = GEEExtractor(args.key, project=args.project) # Initialize GEE
+
         
         # Load Coarse Meta for Filtering (Optional)
         coarse_filter = None

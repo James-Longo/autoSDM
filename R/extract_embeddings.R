@@ -25,7 +25,7 @@ ee_auth_service <- function(json_path = Sys.getenv("GEE_SERVICE_ACCOUNT_KEY"), v
 #' @param background_buffer Optional. Numeric vector of length 2: c(min_dist, max_dist).
 #' @return A data frame with added A00-A63 embedding columns.
 #' @keywords internal
-extract_embeddings <- function(df, scale = 10, python_path = NULL, background_method = NULL, background_buffer = NULL) {
+extract_embeddings <- function(df, scale = 10, python_path = NULL, gee_project = NULL, background_method = NULL, background_buffer = NULL) {
   python_path <- resolve_python_path(python_path)
 
   if (is.null(python_path)) {
@@ -45,6 +45,11 @@ extract_embeddings <- function(df, scale = 10, python_path = NULL, background_me
     "--output", shQuote(tmp_out),
     "--scale", scale
   )
+
+  if (!is.null(gee_project) && gee_project != "") {
+    args <- c(args, "--project", shQuote(gee_project))
+  }
+
 
   if (!is.null(background_method)) {
     args <- c(args, "--background-method", background_method)
