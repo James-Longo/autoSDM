@@ -6,11 +6,8 @@ Description: This package extracts Alpha Earth embeddings from Google Earth Engi
 License: MIT
 Encoding: UTF-8
 LazyData: true
-Imports: 
-    vroom,
-    ggplot2,
+Imports:
+    reticulate,
     jsonlite,
-    rgee,
-    reticulate
-Suggests: 
-    testthat (>= 3.0.0)
+    sf,
+    terra

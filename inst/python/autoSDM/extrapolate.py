@@ -81,8 +81,8 @@ def generate_prediction_map(centroid, df=None, coarse_filter=None, aoi=None):
     """
     asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
     
-    # Get the latest Alpha Earth image (2024)
-    yr = 2024
+    # Get the latest Alpha Earth image (2025)
+    yr = 2025
     img = ee.ImageCollection(asset_path)\
         .filter(ee.Filter.calendarRange(yr, yr, 'year'))\
         .mosaic()
@@ -146,7 +146,7 @@ def generate_classifier_prediction_map(classifier, df=None, ecological_vars=None
         aoi: ee.Geometry.
     """
     asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
-    yr = 2024
+    yr = 2025
     img = ee.ImageCollection(asset_path)\
         .filter(ee.Filter.calendarRange(yr, yr, 'year'))\
         .mosaic()
@@ -244,12 +244,17 @@ def download_mask(mask, aoi, scale, filename):
     
     # Check if single tile is sufficient
     if w_px <= CHUNK_SIZE and h_px <= CHUNK_SIZE:
-        if _download_single_tile(mask, aoi, scale, filename):
+        success, _, error_msg = _download_single_tile(mask, aoi, scale, filename)
+        if success:
             return [filename]
+        if error_msg:
+            sys.stderr.write(f"Failed to download {filename}: {error_msg}\n")
         return []
 
     # Tiled download
+    total_ha = (w_px * h_px * scale**2) / 10000.0
     sys.stderr.write(f"Mask too large ({int(w_px)}x{int(h_px)} px) for single download. Tiling...\n")
+    sys.stderr.write(f"Total mapping area: {total_ha:,.1f} hectares\n")
     
     n_x = math.ceil(w_px / CHUNK_SIZE)
     n_y = math.ceil(h_px / CHUNK_SIZE)
@@ -258,14 +263,18 @@ def download_mask(mask, aoi, scale, filename):
     lat_step = (max_lat - min_lat) / (h_px / CHUNK_SIZE)
     
     name_root, ext = os.path.splitext(filename)
-    tasks = []
+    tasks = {} # future -> (tile_name, tile_ha)
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
         for i in range(n_x):
             for j in range(n_y):
+                # Calculate this tile's specific dimensions for accurate hectare tracking
+                tile_w = CHUNK_SIZE if (i + 1) * CHUNK_SIZE <= w_px else (w_px % CHUNK_SIZE)
+                tile_h = CHUNK_SIZE if (j + 1) * CHUNK_SIZE <= h_px else (h_px % CHUNK_SIZE)
+                tile_ha = (tile_w * tile_h * scale**2) / 10000.0
+
                 x0 = min_lon + i * lon_step
-                x1 = min_lon + (i + 1) * lon_step # simpler arithmetic
-                # Clamp to max bounds to avoid floating point overshoot
+                x1 = min_lon + (i + 1) * lon_step
                 if i == n_x - 1: x1 = max_lon
                 
                 y0 = min_lat + j * lat_step
@@ -275,9 +284,67 @@ def download_mask(mask, aoi, scale, filename):
                 tile_aoi = ee.Geometry.Rectangle([x0, y0, x1, y1])
                 tile_name = f"{name_root}_{i}_{j}{ext}"
                 
-                tasks.append(executor.submit(_download_single_tile, mask, tile_aoi, scale, tile_name))
+                future = executor.submit(_download_single_tile, mask, tile_aoi, scale, tile_name)
+                tasks[future] = (tile_name, tile_ha)
     
-    return [t.result() for t in tasks if t.result()]
+    total_tiles = len(tasks)
+    total_tile_ha = sum(t[1] for t in tasks.values())
+    completed_tiles = 0
+    completed_ha = 0.0
+    downloaded_bytes = 0
+    results = []
+    failures = []
+    
+    # Initial status
+    sys.stderr.write(f"Progress: 0 / {total_tile_ha:,.0f} hectares (0%) | Tile 0/{total_tiles} | 0.0 MB\r")
+    sys.stderr.flush()
+    
+    for future in concurrent.futures.as_completed(tasks):
+        completed_tiles += 1
+        tile_name, tile_ha = tasks[future]
+        
+        try:
+            success, _, size, error_msg = future.result()
+            
+            # Always increment processed area regardless of success (includes masked/empty tiles)
+            completed_ha += tile_ha
+            
+            if success:
+                results.append(tile_name)
+                if size:
+                    downloaded_bytes += size
+            elif error_msg:
+                failures.append((tile_name, error_msg))
+            # success=False, error_msg=None is expected for masked tiles
+                
+        except Exception as e:
+            failures.append((tile_name, f"Exception: {str(e)}"))
+            completed_ha += tile_ha
+
+        percent = (completed_ha / total_tile_ha) * 100
+        mb = downloaded_bytes / (1024 * 1024)
+        sys.stderr.write(f"\rProgress: {completed_ha:,.0f} / {total_tile_ha:,.0f} hectares ({percent:.1f}%) | Tile {completed_tiles}/{total_tiles} | {mb:.1f} MB")
+        sys.stderr.flush()
+    
+    sys.stderr.write("\n")
+
+    if failures:
+        sys.stderr.write(f"Summary of {len(failures)} failures:\n")
+        # Group failures by error message
+        from collections import defaultdict
+        err_summary = defaultdict(list)
+        for tile_name, error_msg in failures:
+            err_summary[error_msg].append(tile_name)
+        
+        for error_msg, tiles in err_summary.items():
+            if len(tiles) > 3:
+                sys.stderr.write(f"  - {error_msg}: {len(tiles)} tiles failed (e.g., {os.path.basename(tiles[0])})\n")
+            else:
+                tile_bases = [os.path.basename(t) for t in tiles]
+                sys.stderr.write(f"  - {error_msg}: {', '.join(tile_bases)}\n")
+
+    return results
+
 
 def export_to_gcs(image, region, scale, bucket, filename_prefix):
     """
@@ -306,9 +373,10 @@ def export_to_gcs(image, region, scale, bucket, filename_prefix):
 def _download_single_tile(mask, region, scale, filename):
     import time
     if os.path.exists(filename) and os.path.getsize(filename) > 0:
-        return filename
+        return (True, filename, None)
         
     max_retries = 3
+    last_error = None
     for attempt in range(max_retries):
         try:
             name = os.path.splitext(os.path.basename(filename))[0]
@@ -321,22 +389,24 @@ def _download_single_tile(mask, region, scale, filename):
             
             response = requests.get(url, stream=True, timeout=120)
             if response.status_code == 200:
+                size = 0
                 with open(filename, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-                sys.stderr.write(f"Downloaded {filename}\n")
-                return filename
+                        size += len(chunk)
+                return (True, filename, size, None)
             elif response.status_code == 400:
                 # Likely an empty tile (masked out)
-                return None
+                return (False, filename, 0, None)
             else:
-                sys.stderr.write(f"Attempt {attempt+1} failed for {filename}: HTTP {response.status_code}\n")
+                last_error = f"HTTP {response.status_code}"
                 
         except Exception as e:
-            sys.stderr.write(f"Attempt {attempt+1} error for {filename}: {str(e)}\n")
+            last_error = str(e)
         
         if attempt < max_retries - 1:
             time.sleep(5)
             
-    return None
+    return (False, filename, 0, last_error)
+
 

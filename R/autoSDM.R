@@ -14,6 +14,7 @@
 #' @param gee_project Optional. Google Cloud Project ID for Earth Engine. Required for newer API versions.
 #' @param cv Optional. Boolean whether to run 5-fold Spatial Block Cross-Validation. Defaults to FALSE.
 #' @return A list containing model metadata, performance metrics, and paths to the generated maps.
+
 #' @export
 autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_method = "sample_extent", background_buffer = NULL, python_path = NULL, gee_project = NULL, cv = FALSE) {
   # 1. Validate standardized column names

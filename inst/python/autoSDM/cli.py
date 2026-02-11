@@ -245,7 +245,7 @@ def main():
                 # Let's just visualize the one used inside if we can access it? 
                 # We can't easily access internal variables of the function.
                 # Let's recreate it here for the map.
-                yr = 2024
+                yr = 2025
                 img = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL").filter(ee.Filter.calendarRange(yr, yr, 'year')).mosaic()
                 coarse_centroid_img = ee.Image.constant(list(coarse_filter['centroid']))
                 # Use native projection logic same as interpolate.py

@@ -98,7 +98,13 @@ def analyze_embeddings(df, class_property='present'):
     if class_property in df.columns:
         cols_to_check = emb_cols + [class_property]
     
+    before_count = len(df)
     df_clean = df.dropna(subset=cols_to_check).copy()
+    after_count = len(df_clean)
+    
+    if after_count < before_count:
+        import sys
+        sys.stderr.write(f"Centroid Analysis: Dropped {before_count - after_count} points due to missing embeddings or class property.\n")
     
     if df_clean.empty:
         raise ValueError(f"No valid data found after dropping NAs. Rows: {len(df)}")

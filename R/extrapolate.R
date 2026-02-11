@@ -116,7 +116,7 @@ extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10
 
   if (!is.null(res$monitoring_url)) {
     message("Monitoring URL: ", res$monitoring_url)
-    message("You can also monitor via rgee::ee_monitoring() if you have rgee installed.")
+    message("You can also monitor via rgee::ee_monitoring().")
   }
 
   return(res)

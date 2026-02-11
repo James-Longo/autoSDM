@@ -108,8 +108,30 @@ def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='p
     ecological_vars = [name_map[col] for col in ecological_vars]
     class_property = name_map[class_property]
 
-    # 3. Drop NAs (on predictors we have locally, like nuisance)
-    df_clean = df.dropna(subset=nuisance_vars + [class_property]).copy()
+    # 3. Drop NAs (on predictors we have locally)
+    # Ensure all features passed to GEE have non-NaN values for all predictors and coordinates.
+    target_cols = [class_property, name_map['latitude'], name_map['longitude']]
+    available_predictors = [v for v in all_predictors if v in df.columns]
+    
+    before_count = len(df)
+    # Check for NaNs to report why
+    nan_predictors = df[available_predictors].isna().any(axis=1).sum()
+    nan_coords = df[[name_map['latitude'], name_map['longitude']]].isna().any(axis=1).sum()
+    nan_class = df[class_property].isna().sum()
+    
+    df_clean = df.dropna(subset=target_cols + available_predictors).copy()
+    after_count = len(df_clean)
+    
+    if after_count < before_count:
+        dropped = before_count - after_count
+        sys.stderr.write(f"--- Data Cleaning ---\n")
+        sys.stderr.write(f"Dropped {dropped} points due to missing values:\n")
+        if nan_predictors > 0: sys.stderr.write(f"  - Missing predictors (nuisance or pre-extracted embeddings): {nan_predictors}\n")
+        if nan_coords > 0: sys.stderr.write(f"  - Missing coordinates (lat/lon): {nan_coords}\n")
+        if nan_class > 0: sys.stderr.write(f"  - Missing class property ({class_property}): {nan_class}\n")
+        sys.stderr.write(f"Remaining points: {after_count}\n")
+        sys.stderr.write(f"---------------------\n")
+
     if df_clean.empty:
         raise ValueError("No valid training data remaining after dropping missing values.")
 

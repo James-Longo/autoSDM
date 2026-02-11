@@ -68,25 +68,12 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, py
     cbi <- if (!is.null(metrics$cbi)) metrics$cbi else NULL
     auc <- if (!is.null(metrics$auc)) metrics$auc else NULL
 
-    # Create histogram
-    library(ggplot2)
-    p <- ggplot(data.frame(dot_product = dot_products), aes(x = dot_product)) +
-      geom_histogram(bins = 30, fill = "#69b3a2", color = "#e9ecef", alpha = 0.9) +
-      theme_minimal() +
-      labs(
-        title = "Cosine Similarity to Species Centroid",
-        subtitle = "Distribution of embedding similarities",
-        x = "Cosine Similarity (Dot Product)",
-        y = "Frequency"
-      )
-
     # CBI and AUC are returned as metrics.
 
     return(list(
       mean_embedding = mean_emb,
       dot_products = dot_products,
       metrics = metrics,
-      plot = p,
       data = df_clean,
       method = "centroid"
     ))

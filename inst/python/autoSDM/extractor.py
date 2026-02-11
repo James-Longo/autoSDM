@@ -58,11 +58,17 @@ class GEEExtractor:
             )
             df = pd.concat([df, bg_df], ignore_index=True)
 
-        # Alpha Earth range: 2017-2024
-        df = df[(df['year'] >= 2017) & (df['year'] <= 2024)].copy()
-        if df.empty:
-            sys.stderr.write("No locations within the 2017-2024 year range found.\n")
-            return pd.DataFrame()
+        # Alpha Earth range: 2017-2025
+        before_yr_count = len(df)
+        df = df[(df['year'] >= 2017) & (df['year'] <= 2025)].copy()
+        after_yr_count = len(df)
+        
+        if after_yr_count < before_yr_count:
+            if after_yr_count == 0:
+                sys.stderr.write("No locations within the 2017-2025 year range found.\n")
+                return pd.DataFrame()
+            else:
+                sys.stderr.write(f"Dropped {before_yr_count - after_yr_count} points outside Alpha Earth range (2017-2025).\n")
 
         years = sorted(df['year'].unique())
         all_yearly_fcs = []
@@ -112,6 +118,15 @@ class GEEExtractor:
                             df.at[idx, k] = v
             except Exception as e:
                 sys.stderr.write(f"Error during GEE retrieval for chunk {i//chunk_size + 1}: {str(e)}\n")
+        
+        # Drop rows where extraction failed (e.g. masked areas)
+        emb_cols = [f"A{i:02d}" for i in range(64)]
+        if all(col in df.columns for col in emb_cols):
+            before_count = len(df)
+            df = df.dropna(subset=emb_cols).copy()
+            after_count = len(df)
+            if after_count < before_count:
+                sys.stderr.write(f"Dropped {before_count - after_count} points where Alpha Earth embeddings were unavailable (likely due to masked pixels or being outside valid regions).\n")
         
         return df
 
