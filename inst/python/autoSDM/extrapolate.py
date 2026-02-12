@@ -131,7 +131,7 @@ def generate_prediction_map(centroid, df=None, coarse_filter=None, aoi=None):
 
 def generate_classifier_prediction_map(classifier, df=None, ecological_vars=None, nuisance_optima=None, coarse_filter=None, aoi=None):
     """
-    Generates a prediction map for a classifier (RF, Maxent, etc.) at standardized nuisance levels.
+    Generates a prediction map for a classifier (e.g., Maxent) at standardized nuisance levels.
     
     Args:
         classifier: Trained ee.Classifier.

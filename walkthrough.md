@@ -39,11 +39,11 @@ This guide covers the advanced usage of the `autoSDM` pipeline, including multi-
 ### 2.1. Data Preparation
 
 Your CSV should contain `Latitude`, `Longitude`, `Year`, and a presence column (e.g., `present?`). 
-If using **Maxent** or **Random Forest**, you can include nuisance variables like `ObserverID` or `TimeOfDay` to account for sampling bias.
+You can include nuisance variables to account for sampling bias.
 
 ### 2.2. Extraction & Robust Analysis
 
-We extract embeddings at our target resolution. `autoSDM` uses the **Geometric Median** for centroid analysis, which is the most robust "central" point in 64-dimensional space, effectively ignoring outliers in your presence data.
+We extract embeddings at our target resolution. `autoSDM` uses the **Geometric Median** for centroid analysis, which is the "central" point in 64-dimensional space, effectively ignoring outliers in your presence data.
 
 ```bash
 # 1. Extract 100m embeddings
@@ -53,7 +53,7 @@ python -m autoSDM.cli extract --input sightings.csv --output extraction_100m.csv
 python -m autoSDM.cli analyze --input extraction_100m.csv --output centroid_results.csv --method centroid
 ```
 
-## 3. Advanced Modeling (Maxent & RF)
+## 3. Advanced Modeling (Maxent)
 
 For presence-absence data, you can train a Maxent model. `autoSDM` handles nuisance standardization automatically by holding non-ecological variables at their "optima" during map generation.
 

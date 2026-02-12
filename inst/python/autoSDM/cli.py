@@ -4,6 +4,7 @@ warnings.filterwarnings("ignore", message=".*Python version.*will stop supportin
 
 import argparse
 import pandas as pd
+import numpy as np
 import os
 import sys
 import json
@@ -13,7 +14,7 @@ from autoSDM.extrapolate import generate_prediction_map, download_mask, export_t
 
 def main():
     parser = argparse.ArgumentParser(description="autoSDM CLI")
-    parser.add_argument("mode", choices=["extract", "analyze", "extrapolate", "ensemble"])
+    parser.add_argument("mode", choices=["extract", "analyze", "extrapolate", "ensemble", "predict"])
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--key", help="Optional GEE service account key path. If not provided, uses existing session auth.")
@@ -148,7 +149,83 @@ def main():
             json.dump(meta, f)
         sys.stderr.write(f"Analysis complete. Results saved to {args.output} and {meta_path}\n")
 
-    elif args.mode in ["extrapolate", "ensemble"]:
+    elif args.mode == "predict":
+        # Point Prediction Mode
+        df = pd.read_csv(args.input)
+        
+        # 1. Extract Embeddings for these specific points
+        extractor = GEEExtractor(args.key, project=args.project)
+        df_emb = extractor.extract_embeddings(df, scale=args.scale)
+        
+        if df_emb.empty:
+            sys.stderr.write("Error: Point extraction returned no data.\n")
+            sys.exit(1)
+            
+        # 2. Load Metadata
+        with open(args.meta) as f:
+            meta = json.load(f)
+        
+        method = meta.get('method', 'centroid')
+        
+        # 3. Optional Coarse Filter
+        if args.coarse_meta:
+            with open(args.coarse_meta) as f:
+                coarse_meta = json.load(f)
+            
+            # Extract coarse embeddings for filtering
+            df_coarse = extractor.extract_embeddings(df, scale=1000)
+            if not df_coarse.empty:
+                coarse_centroid = np.array(coarse_meta['centroid'])
+                coarse_emb_cols = [f"A{i:02d}" for i in range(64)]
+                coarse_sims = np.dot(df_coarse[coarse_emb_cols].values, coarse_centroid)
+                
+                # Filter df_emb based on coarse threshold
+                valid_mask = coarse_sims >= coarse_meta.get('threshold_5pct', -1)
+                df_emb = df_emb[valid_mask].copy()
+                sys.stderr.write(f"Coarse filter dropped {np.sum(~valid_mask)} points.\n")
+
+        # 4. Run Predictions
+        emb_cols = [f"A{i:02d}" for i in range(64)]
+        if method == "centroid":
+            centroid = np.array(meta['centroid'])
+            df_emb['similarity'] = np.dot(df_emb[emb_cols].values, centroid)
+        
+        elif method == "maxent":
+            # Maxent requires GEE classification for the points
+            import ee
+            try: ee.Initialize(project=args.project) if args.project else ee.Initialize()
+            except: pass
+            
+            classifier = ee.deserializer.fromJSON(meta['classifier_serialized'])
+            ecological_vars = meta['ecological_vars']
+            nuisance_vars = meta['nuisance_vars']
+            nuisance_optima = meta['nuisance_optima']
+            
+            # Create FeatureCollection for the points with optimal nuisance values
+            features = []
+            for idx, row in df_emb.iterrows():
+                props = {v: float(row[v]) for v in ecological_vars if v in row}
+                for v, opt in nuisance_optima.items():
+                    props[v] = float(opt)
+                geom = ee.Geometry.Point([row['longitude'], row['latitude']])
+                features.append(ee.Feature(geom, props).set('orig_index', str(idx)))
+            
+            fc = ee.FeatureCollection(features)
+            
+            from autoSDM.trainer import get_safe_scores_and_labels
+            scores, orig_indices = get_safe_scores_and_labels(classifier, fc, 'orig_index', name="Maxent Prediction")
+            
+            # Map scores back to df_emb
+            df_emb['similarity'] = np.nan
+            for s, idx_str in zip(scores, orig_indices):
+                df_emb.at[int(float(idx_str)), 'similarity'] = s
+
+        # 5. Save Results
+        os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
+        df_emb.to_csv(args.output, index=False)
+        sys.stderr.write(f"Point predictions complete. Results saved to {args.output}\n")
+
+    elif args.mode == "ensemble":
         if not args.meta:
             sys.stderr.write(f"Error: --meta required for {args.mode} mode\n")
             sys.exit(1)

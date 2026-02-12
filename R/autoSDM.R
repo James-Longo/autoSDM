@@ -13,10 +13,11 @@
 #' @param python_path Optional. Path to Python executable. Auto-detected if not provided.
 #' @param gee_project Optional. Google Cloud Project ID for Earth Engine. Required for newer API versions.
 #' @param cv Optional. Boolean whether to run 5-fold Spatial Block Cross-Validation. Defaults to FALSE.
+#' @param predict_coords Optional. Data frame of coordinates to predict at.
 #' @return A list containing model metadata, performance metrics, and paths to the generated maps.
 
 #' @export
-autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_method = "sample_extent", background_buffer = NULL, python_path = NULL, gee_project = NULL, cv = FALSE) {
+autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_method = "sample_extent", background_buffer = NULL, python_path = NULL, gee_project = NULL, cv = FALSE, predict_coords = NULL) {
   # 1. Validate standardized column names
   required_cols <- c("longitude", "latitude", "year")
   missing <- setdiff(required_cols, names(data))
@@ -164,6 +165,21 @@ autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_meth
 
   # Load results
   final_results <- jsonlite::fromJSON(ensemble_results_json)
+
+  # 9. Optional: Predict at specific coordinates
+  if (!is.null(predict_coords)) {
+    message("--- Step 5: Predicting at specific coordinates ---")
+    # We use the centroid model for point predictions by default in this ensemble context,
+    # or we could predict for both. Let's start with centroid.
+    point_preds <- predict_at_coords(
+      predict_coords,
+      analysis_meta_path = file.path(output_dir, "centroid.json"),
+      scale = scale,
+      python_path = python_path,
+      gee_project = gee_project
+    )
+    final_results$point_predictions <- point_preds
+  }
 
   message("autoSDM pipeline complete!")
   return(final_results)

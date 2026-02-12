@@ -4,7 +4,7 @@
 
 ## 🎯 Key Features
 
-- **Multi-Model Support**: Choose between **Centroid** (Presence-Only), **Maxent**, and **Random Forest** (Presence/Absence) approaches.
+- **Multi-Model Support**: Choose between **Centroid** (Presence-Only) and **Maxent** (Presence/Absence) approaches.
 - **Robust Characterization**: Uses the **Geometric Median** to define the species' environmental centroid, providing high resistance to outliers in ecological niche space.
 - **Unified Ensemble**: Generate "Agreement Maps" by ensembling multiple models (e.g., Centroid $\times$ Maxent) to highlight high-confidence habitat.
 - **Hierarchical Filtering**: Efficiency at scale. Use 1000m coarse models to mask the compute-heavy 10m high-resolution runs.
@@ -27,7 +27,18 @@ devtools::install_github("James-Longo/autoSDM")
 *Ensure you have Python installed on your system.*
 
 **Google Earth Engine:**
-You must have a GEE account. On first run, the package will check for authentication.
+You must have a GEE account. Before running the package, ensure you have authenticated and initialized your Earth Engine session:
+
+```r
+library(rgee)
+# One-time authentication
+ee_Authenticate()
+
+# Initialize session (required for every session)
+ee_Initialize()
+```
+
+If you are using a specific Google Cloud project, provide it during initialization: `ee_Initialize(project = "your-project-id")`.
 
 ---
 
@@ -58,7 +69,7 @@ Extracts Alpha Earth embeddings from Google Earth Engine for a set of occurrence
 ### 2. Analyze
 Trains the selected model and determines ecological thresholds.
 - **Presence-Only (Centroid)**: Calculates the Geometric Median and dot-product similarity.
-- **Presence/Absence (Maxent/RF)**: Trains a classifier and optimizes predictions for detection bias.
+- **Presence/Absence (Maxent)**: Trains a classifier and optimizes predictions for detection bias.
 - **Advanced Tuning**: Automatically calculates **95% TPR**, **95% TNR**, **Balanced**, and **AUC** metrics.
 
 ### 3. Extrapolate & Ensemble
