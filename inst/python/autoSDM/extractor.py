@@ -40,7 +40,7 @@ class GEEExtractor:
         
         # 1. Background Generation (if presence-only and requested)
         needs_bg = False
-        if background_method:
+        if background_method and background_method != "none":
             if 'present' not in df.columns:
                 needs_bg = True
                 df['present'] = 1
@@ -71,62 +71,96 @@ class GEEExtractor:
                 sys.stderr.write(f"Dropped {before_yr_count - after_yr_count} points outside Alpha Earth range (2017-2025).\n")
 
         years = sorted(df['year'].unique())
-        all_yearly_fcs = []
         
-        sys.stderr.write(f"Preparing sampling requests for {len(years)} years...\n")
-        for yr in years:
-            yr_df = df[df['year'] == yr].copy()
-            
-            img = ee.ImageCollection(asset_path)\
-                .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))\
-                .mosaic()
-            
-            features = []
-            for idx, row in yr_df.iterrows():
-                geom = ee.Geometry.Point([row['longitude'], row['latitude']])
-                feat = ee.Feature(geom, {'orig_index': str(idx)})
-                features.append(feat)
-            
-            fc = ee.FeatureCollection(features)
-            sampled = img.reduceRegions(
-                collection=fc,
-                reducer=ee.Reducer.mean(),
-                scale=scale
-            )
-            all_yearly_fcs.append(sampled)
-            
-        # Merge all years into one collection
-        total_fc = ee.FeatureCollection(all_yearly_fcs).flatten()
+        # CLIENT-SIDE CHUNKING with CONCURRENT processing
+        # Use sampleRegions (optimized for points) instead of reduceRegions
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
         
-        # Retrieve in chunks to avoid GEE limits
-        chunk_size = 4000
+        chunk_size = 2000
         total_count = len(df)
-        total_list = total_fc.toList(total_count)
+        num_chunks = (total_count + chunk_size - 1) // chunk_size
+        max_workers = 8  # Parallel GEE requests
         
-        sys.stderr.write(f"Retrieving embeddings for {total_count} points in {len(years)} years...\n")
+        sys.stderr.write(f"Processing {total_count} points across {len(years)} years in {num_chunks} chunks (size {chunk_size}, {max_workers} parallel)...\n")
         
-        for i in range(0, total_count, chunk_size):
-            sys.stderr.write(f"Retrieving embedding chunk {i//chunk_size + 1}...\n")
-            chunk = ee.List(total_list.slice(i, i + chunk_size))
+        # Thread-safe lock for updating the DataFrame
+        df_lock = threading.Lock()
+        completed_count = [0]  # mutable counter
+        
+        def process_chunk(chunk_idx, chunk_df):
+            """Process a single chunk: create FC, sampleRegions, return results."""
             try:
-                res = chunk.getInfo()
-                for feat in res:
-                    props = feat['properties']
-                    if 'A00' in props and props['A00'] is not None:
-                        idx = int(props.pop('orig_index'))
-                        for k, v in props.items():
-                            df.at[idx, k] = v
+                chunk_years = sorted(chunk_df['year'].unique())
+                results = []
+                
+                for yr in chunk_years:
+                    yr_df = chunk_df[chunk_df['year'] == yr]
+                    if yr_df.empty:
+                        continue
+                    
+                    # Build lightweight FeatureCollection for this chunk
+                    features = []
+                    for idx, row in yr_df.iterrows():
+                        geom = ee.Geometry.Point([row['longitude'], row['latitude']])
+                        feat = ee.Feature(geom, {'orig_index': int(idx)})
+                        features.append(feat)
+                    
+                    if not features:
+                        continue
+                    fc = ee.FeatureCollection(features)
+                    
+                    # Use sampleRegions — optimized for point extraction
+                    img = ee.ImageCollection(asset_path)\
+                        .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))\
+                        .mosaic()
+                    
+                    sampled = img.sampleRegions(
+                        collection=fc,
+                        scale=scale,
+                        geometries=False  # Don't return geometry — saves bandwidth
+                    )
+                    
+                    res = sampled.getInfo()['features']
+                    results.extend(res)
+                
+                # Apply results back to the DataFrame
+                with df_lock:
+                    for feat in results:
+                        props = feat['properties']
+                        if 'A00' in props and props['A00'] is not None:
+                            idx = int(props['orig_index'])
+                            for k, v in props.items():
+                                if k != 'orig_index':
+                                    df.at[idx, k] = v
+                    completed_count[0] += 1
+                    sys.stderr.write(f"Completed chunk {completed_count[0]}/{num_chunks}\n")
+                    
             except Exception as e:
-                sys.stderr.write(f"Error during GEE retrieval for chunk {i//chunk_size + 1}: {str(e)}\n")
+                with df_lock:
+                    completed_count[0] += 1
+                sys.stderr.write(f"Error in chunk {chunk_idx}: {e}\n")
         
-        # Drop rows where extraction failed (e.g. masked areas)
+        # Submit all chunks concurrently
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for i in range(0, total_count, chunk_size):
+                chunk_df = df.iloc[i : i + chunk_size].copy()
+                chunk_idx = i // chunk_size + 1
+                futures.append(executor.submit(process_chunk, chunk_idx, chunk_df))
+            
+            # Wait for all to finish
+            for f in as_completed(futures):
+                pass  # Errors are already logged inside process_chunk
+        
+        # Post-processing: Drop failed rows
         emb_cols = [f"A{i:02d}" for i in range(64)]
         if all(col in df.columns for col in emb_cols):
             before_count = len(df)
             df = df.dropna(subset=emb_cols).copy()
             after_count = len(df)
             if after_count < before_count:
-                sys.stderr.write(f"Dropped {before_count - after_count} points where Alpha Earth embeddings were unavailable (likely due to masked pixels or being outside valid regions).\n")
+                sys.stderr.write(f"Dropped {before_count - after_count} points where Alpha Earth embeddings were unavailable.\n")
         
         return df
 

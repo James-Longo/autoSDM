@@ -32,13 +32,28 @@ extract_embeddings <- function(df, scale = 10, python_path = NULL, gee_project =
     stop("python_path could not be resolved. Please configure reticulate or pass python_path explicitly.")
   }
 
+  # Check if embeddings are already present
+  emb_cols <- sprintf("A%02d", 0:63)
+  if (all(emb_cols %in% names(df))) {
+    message("Embeddings already present. Skipping extraction.")
+    return(df)
+  }
+
+  # 1. Identify unique coordinate-year combinations to avoid redundant GEE calls
+  # This is crucial for multi-species datasets like SatBird where many species share locations.
+  # Include 'present' so the Python extractor can detect absences and skip background generation.
+  dedup_cols <- c("longitude", "latitude", "year")
+  keep_cols <- dedup_cols
+  if ("present" %in% names(df)) keep_cols <- c(keep_cols, "present")
+  df_unique <- df[!duplicated(df[, dedup_cols]), keep_cols]
+
   # Create temp files
   tmp_in <- tempfile(fileext = ".csv")
   tmp_out <- tempfile(fileext = ".csv")
 
-  write.csv(df, tmp_in, row.names = FALSE)
+  write.csv(df_unique, tmp_in, row.names = FALSE)
 
-  message("Calling Python GEE extractor (via system)...")
+  message(sprintf("Calling Python GEE extractor for %d unique locations...", nrow(df_unique)))
   args <- c(
     "-m", "autoSDM.cli", "extract",
     "--input", shQuote(tmp_in),
@@ -72,10 +87,28 @@ extract_embeddings <- function(df, scale = 10, python_path = NULL, gee_project =
     stop("Python extraction failed.")
   }
 
-  res <- read.csv(tmp_out)
+  res_unique <- read.csv(tmp_out)
   # Clean up
   unlink(tmp_in)
   unlink(tmp_out)
+
+  # 2. Join embeddings back to the original (multi-species) data frame
+  # Standardize column types for robust joining
+  res_unique$longitude <- as.numeric(res_unique$longitude)
+  res_unique$latitude <- as.numeric(res_unique$latitude)
+  res_unique$year <- as.numeric(res_unique$year)
+
+  # Drop 'present' from extracted results to avoid duplicate columns on merge
+  # (the original df already has the authoritative 'present' column)
+  if ("present" %in% names(res_unique)) {
+    res_unique$present <- NULL
+  }
+
+  df$longitude <- as.numeric(df$longitude)
+  df$latitude <- as.numeric(df$latitude)
+  df$year <- as.numeric(df$year)
+
+  res <- merge(df, res_unique, by = c("longitude", "latitude", "year"), all.x = TRUE)
 
   return(res)
 }

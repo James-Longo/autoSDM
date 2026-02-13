@@ -5,7 +5,7 @@
 #'
 #' @param data A data frame formatted via `format_data()`. Must have standardized lowercase columns
 #'   (longitude, latitude, year, present). Any additional columns are treated as nuisance variables.
-#' @param aoi Mandatory. Either a list with `lat`, `lon`, and `radius` (in meters), or a character string path to a polygon file (GeoJSON or Shapefile).
+#' @param aoi Optional. Either a list with `lat`, `lon`, and `radius` (in meters), or a character string path to a polygon file (GeoJSON or Shapefile). Required for map generation. If NULL and `predict_coords` is provided, only point predictions are returned (no map).
 #' @param output_dir Optional. Directory to save results. Defaults to the current working directory.
 #' @param scale Optional. Resolution in meters for the final map. Defaults to 10.
 #' @param background_method Optional. Method to generate background points if presence-only data is provided. Defaults to "sample_extent". Options: "sample_extent", "buffer".
@@ -14,10 +14,14 @@
 #' @param gee_project Optional. Google Cloud Project ID for Earth Engine. Required for newer API versions.
 #' @param cv Optional. Boolean whether to run 5-fold Spatial Block Cross-Validation. Defaults to FALSE.
 #' @param predict_coords Optional. Data frame of coordinates to predict at.
-#' @return A list containing model metadata, performance metrics, and paths to the generated maps.
+#' @return A list containing model metadata, performance metrics, and (if aoi is provided) paths to the generated maps.
 
 #' @export
-autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_method = "sample_extent", background_buffer = NULL, python_path = NULL, gee_project = NULL, cv = FALSE, predict_coords = NULL) {
+autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, background_method = "sample_extent", background_buffer = NULL, python_path = NULL, gee_project = NULL, cv = FALSE, predict_coords = NULL) {
+  # Validate: need at least aoi or predict_coords
+  if (is.null(aoi) && is.null(predict_coords)) {
+    stop("You must provide either 'aoi' (for map generation) or 'predict_coords' (for point predictions), or both.")
+  }
   # 1. Validate standardized column names
   required_cols <- c("longitude", "latitude", "year")
   missing <- setdiff(required_cols, names(data))
@@ -30,9 +34,9 @@ autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_meth
 
   # 2. Auto-detect nuisance variables
   standard_cols <- c("longitude", "latitude", "year", "present")
+  emb_cols <- sprintf("A%02d", 0:63)
   all_cols <- names(data)
-  nuisance_vars <- setdiff(all_cols, standard_cols)
-
+  nuisance_vars <- setdiff(all_cols, c(standard_cols, emb_cols, "species")) # Exclude species from nuisance
   if (length(nuisance_vars) > 0) {
     message(sprintf("Detected nuisance variables: %s", paste(nuisance_vars, collapse = ", ")))
   }
@@ -66,14 +70,9 @@ autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_meth
   # Create output directory
   dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
 
-  # 5. Paths for results
-  extract_csv <- file.path(output_dir, "autoSDM_extracted_embeddings.csv")
-  centroid_meta <- file.path(output_dir, "model_centroid.json")
-  maxent_meta <- file.path(output_dir, "model_maxent.json")
-  ensemble_results_json <- file.path(output_dir, "ensemble_results.json")
-
-  # 6. Step # 6. Extract Embeddings (Satellite Data)
-  message("--- Step 1: Extracting Alpha Earth Embeddings ---")
+  # 5. Extract Embeddings (Satellite Data)
+  # Step 1: Extracting Alpha Earth Embeddings (Once for all unique coordinates)
+  message("--- Step 1: Extracting Alpha Earth Embeddings (Coordinate-Centric) ---")
   embedded_data <- extract_embeddings(
     data,
     scale = scale,
@@ -82,105 +81,134 @@ autoSDM <- function(data, aoi, output_dir = getwd(), scale = 10, background_meth
     background_method = background_method,
     background_buffer = background_buffer
   )
-  write.csv(embedded_data, extract_csv, row.names = FALSE)
 
-  # 7. Step 2: Analysis (Centroid + Maxent)
-  message("--- Step 2: Running Centroid Analysis ---")
-  res_centroid <- analyze_embeddings(
-    embedded_data,
-    method = "centroid",
-    python_path = python_path,
-    gee_project = gee_project,
-    cv = cv
-  )
-  # Save RDS for R users
-  saveRDS(res_centroid, file.path(output_dir, "analysis_centroid.rds"))
+  # 6. Determine if multi-species or single species
+  is_multi_species <- "species" %in% names(embedded_data) && length(unique(embedded_data$species)) > 1
 
-  message("--- Step 3: Running Maxent Analysis ---")
-  res_maxent <- analyze_embeddings(
-    embedded_data,
-    method = "maxent",
-    nuisance_vars = nuisance_vars,
-    python_path = python_path,
-    gee_project = gee_project,
-    cv = cv
-  )
-  saveRDS(res_maxent, file.path(output_dir, "analysis_maxent.rds"))
+  # Path for shared training data
+  # NOTE: Embeddings (A00-A63) are kept in the CSV because the centroid analyzer
+  # reads them locally. Maxent samples them server-side and ignores these columns.
+  message("--- Preparing training data ---")
 
-  # 8. Step 4: Ensemble Extrapolation
-  message("--- Step 4: Generating Ensemble Extrapolation Map ---")
-
-  args <- c(
-    "-m", "autoSDM.cli", "ensemble",
-    "--input", shQuote(extract_csv),
-    "--output", shQuote(ensemble_results_json),
-    "--meta", shQuote(file.path(output_dir, "autoSDM_extracted_embeddings.json")), # CLI appends .json to output path
-    "--meta2", shQuote(file.path(output_dir, "autoSDM_extracted_embeddings.json")), # This depends on how analyze_embeddings saved them
-    "--scale", scale,
-    "--prefix", "ensemble"
-  )
-
-  # Wait, my analyze_embeddings call above uses CLI internally which saves to tmp files.
-  # Let's just use the metadata paths directly.
-  # Actually, analyze_embeddings.R needs to save the JSON to the output_dir if we want to use them for ensemble.
-  # Let's refine analyze_embeddings.R to take an optional output path for the JSON.
-  # For now, I'll just run the CLI again for the ensemble inputs to be sure.
-
-  nuisance_arg <- if (length(nuisance_vars) > 0) c("--nuisance-vars", paste(nuisance_vars, collapse = ",")) else NULL
-  cv_arg <- if (cv) "--cv" else NULL
-  proj_arg <- if (!is.null(gee_project)) c("--project", shQuote(gee_project)) else NULL
-
-  # Re-run analysis via CLI to ensure files are in output_dir
-  system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(file.path(output_dir, "centroid.csv")), "--method", "centroid", cv_arg, proj_arg))
-  system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(file.path(output_dir, "maxent.csv")), "--method", "maxent", nuisance_arg, cv_arg, proj_arg))
-
-  ensemble_args <- c(
-    "-m", "autoSDM.cli", "ensemble",
-    "--input", shQuote(extract_csv),
-    "--output", shQuote(ensemble_results_json),
-    "--meta", shQuote(file.path(output_dir, "centroid.json")),
-    "--meta2", shQuote(file.path(output_dir, "maxent.json")),
-    "--scale", scale,
-    "--prefix", "autoSDM_ensemble"
-  )
-  if (!is.null(gee_project)) ensemble_args <- c(ensemble_args, "--project", shQuote(gee_project))
-
-  # Handle AOI
-  if (is.list(aoi) && !is.null(aoi$lat)) {
-    ensemble_args <- c(ensemble_args, "--lat", aoi$lat, "--lon", aoi$lon, "--radius", aoi$radius)
-  } else if (is.character(aoi)) {
-    ensemble_args <- c(ensemble_args, "--aoi-path", shQuote(aoi))
-  } else if (inherits(aoi, c("sf", "sfc", "SpatVector"))) {
-    if (inherits(aoi, "SpatVector")) aoi <- sf::st_as_sf(aoi)
-    aoi_path <- file.path(output_dir, "aoi_temp.geojson")
-    sf::st_write(sf::st_transform(aoi, 4326), aoi_path, driver = "GeoJSON", delete_dsn = TRUE, quiet = TRUE)
-    ensemble_args <- c(ensemble_args, "--aoi-path", shQuote(aoi_path))
+  extract_csv <- file.path(output_dir, "autoSDM_training_data.csv")
+  if (requireNamespace("vroom", quietly = TRUE)) {
+    vroom::vroom_write(embedded_data, extract_csv, delim = ",")
+  } else {
+    write.csv(embedded_data, extract_csv, row.names = FALSE)
   }
 
-  status <- system2(python_path, args = ensemble_args, stdout = "", stderr = "")
 
-  if (status != 0) {
-    stop("Ensemble extrapolation failed.")
-  }
+  if (!is_multi_species) {
+    # SINGLE SPECIES WORKFLOW (Legacy/Default)
+    # -------------------------------------------------------------------------
+    message("--- Single-Species Mode ---")
 
-  # Load results
-  final_results <- jsonlite::fromJSON(ensemble_results_json)
+    # 7. Step 2 & 3: Analysis (Centroid + Maxent) via CLI
+    nuisance_arg <- if (length(nuisance_vars) > 0) c("--nuisance-vars", paste(nuisance_vars, collapse = ",")) else NULL
+    cv_arg <- if (cv) "--cv" else NULL
+    proj_arg <- if (!is.null(gee_project)) c("--project", shQuote(gee_project)) else NULL
 
-  # 9. Optional: Predict at specific coordinates
-  if (!is.null(predict_coords)) {
-    message("--- Step 5: Predicting at specific coordinates ---")
-    # We use the centroid model for point predictions by default in this ensemble context,
-    # or we could predict for both. Let's start with centroid.
-    point_preds <- predict_at_coords(
-      predict_coords,
-      analysis_meta_path = file.path(output_dir, "centroid.json"),
-      scale = scale,
-      python_path = python_path,
-      gee_project = gee_project
+    message("--- Step 2: Running Centroid Analysis ---")
+    system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(file.path(output_dir, "centroid.csv")), "--method", "centroid", "--scale", scale, cv_arg, proj_arg))
+
+    message("--- Step 3: Running Maxent Analysis ---")
+    system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(file.path(output_dir, "maxent.csv")), "--method", "maxent", "--scale", scale, nuisance_arg, cv_arg, proj_arg))
+
+    # 8. Predict at specific coordinates (if provided)
+    if (!is.null(predict_coords)) {
+      message("--- Step 4: Predicting at specific coordinates ---")
+
+      # Extract embeddings for prediction coords ONCE (shared by both models)
+      message("  Extracting embeddings for prediction coordinates...")
+      pred_embedded <- extract_embeddings(predict_coords, scale = scale, python_path = python_path, gee_project = gee_project)
+
+      # Predict with each model using pre-embedded data (no re-extraction)
+      preds_c <- predict_at_coords(pred_embedded, analysis_meta_path = file.path(output_dir, "centroid.json"), scale = scale, python_path = python_path, gee_project = gee_project)
+      preds_m <- predict_at_coords(pred_embedded, analysis_meta_path = file.path(output_dir, "maxent.json"), scale = scale, python_path = python_path, gee_project = gee_project)
+      point_preds <- preds_c
+      point_preds$centroid <- preds_c$similarity
+      point_preds$maxent <- preds_m$similarity
+      point_preds$similarity <- preds_c$similarity * preds_m$similarity
+    }
+
+    # 9. Generate Ensemble Extrapolation Map (only if AOI provided)
+    if (!is.null(aoi)) {
+      message("--- Step 5: Generating Ensemble Extrapolation Map ---")
+      ensemble_results_json <- file.path(output_dir, "ensemble_results.json")
+      ensemble_args <- c("-m", "autoSDM.cli", "ensemble", "--input", shQuote(extract_csv), "--output", shQuote(ensemble_results_json), "--meta", shQuote(file.path(output_dir, "centroid.json")), "--meta2", shQuote(file.path(output_dir, "maxent.json")), "--scale", scale, "--prefix", "ensemble")
+      if (!is.null(gee_project)) ensemble_args <- c(ensemble_args, "--project", shQuote(gee_project))
+
+      # Handle AOI
+      if (is.list(aoi) && !is.null(aoi$lat)) {
+        ensemble_args <- c(ensemble_args, "--lat", aoi$lat, "--lon", aoi$lon, "--radius", aoi$radius)
+      } else if (is.character(aoi)) {
+        ensemble_args <- c(ensemble_args, "--aoi-path", shQuote(aoi))
+      }
+
+      status <- system2(python_path, args = ensemble_args)
+      if (status != 0) stop("Ensemble extrapolation failed.")
+
+      final_results <- jsonlite::fromJSON(ensemble_results_json)
+    } else {
+      # No map — return analysis metadata only
+      final_results <- list(
+        centroid_meta = jsonlite::fromJSON(file.path(output_dir, "centroid.json")),
+        maxent_meta   = jsonlite::fromJSON(file.path(output_dir, "maxent.json"))
+      )
+    }
+
+    if (!is.null(predict_coords)) {
+      final_results$point_predictions <- point_preds
+    }
+
+    message("autoSDM pipeline complete!")
+    return(final_results)
+  } else {
+    # MULTI-SPECIES WORKFLOW
+    # -------------------------------------------------------------------------
+    message(sprintf("--- Multi-Species Mode: Processing %d species ---", length(unique(embedded_data$species))))
+    message("Orchestrating GEE server-side parallelization...")
+
+    nuisance_arg <- if (length(nuisance_vars) > 0) c("--nuisance-vars", paste(nuisance_vars, collapse = ",")) else NULL
+    cv_arg <- if (cv) "--cv" else NULL
+    proj_arg <- if (!is.null(gee_project)) c("--project", shQuote(gee_project)) else NULL
+
+    aoi_arg <- NULL
+    if (is.list(aoi) && !is.null(aoi$lat)) {
+      aoi_arg <- c("--lat", aoi$lat, "--lon", aoi$lon, "--radius", aoi$radius)
+    } else if (is.character(aoi)) {
+      aoi_arg <- c("--aoi-path", shQuote(aoi))
+    }
+
+    # Internal multi-species ensemble pipeline in Python
+    # This invokes a single Python process that loops over species and sends requests to GEE.
+    multi_args <- c(
+      "-m", "autoSDM.cli", "analyze",
+      "--input", shQuote(extract_csv),
+      "--output", shQuote(output_dir),
+      "--method", "ensemble",
+      "--species-col", "species",
+      "--scale", scale,
+      nuisance_arg,
+      cv_arg,
+      proj_arg,
+      aoi_arg
     )
-    final_results$point_predictions <- point_preds
-  }
 
-  message("autoSDM pipeline complete!")
-  return(final_results)
+    status <- system2(python_path, args = multi_args)
+    if (status != 0) stop("Multi-species analysis failed.")
+
+    # Load and combine results from species-specific directories
+    species_list <- unique(embedded_data$species)
+    results_list <- list()
+    for (sp in species_list) {
+      res_path <- file.path(output_dir, sp, "ensemble_results.json")
+      if (file.exists(res_path)) {
+        results_list[[sp]] <- jsonlite::fromJSON(res_path)
+      }
+    }
+
+    class(results_list) <- "autoSDM_multi"
+    return(results_list)
+  }
 }

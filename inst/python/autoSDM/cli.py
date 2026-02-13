@@ -8,9 +8,124 @@ import numpy as np
 import os
 import sys
 import json
+import concurrent.futures
 from autoSDM.extractor import GEEExtractor
 from autoSDM.analyzer import analyze_embeddings
 from autoSDM.extrapolate import generate_prediction_map, download_mask, export_to_gcs, merge_rasters
+def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df):
+    import ee
+    try:
+        sp_dir = os.path.join(output_dir, str(sp))
+        os.makedirs(sp_dir, exist_ok=True)
+        
+        # 0. Merge master embeddings into this species dataframe
+        # Join on longitude, latitude, year
+        df_sp = pd.merge(df_sp, master_sampled_df, on=['longitude', 'latitude', 'year'], how='inner')
+        
+        if df_sp.empty:
+            sys.stderr.write(f"--- Warning: No valid points for {sp} after embedding merge ---\n")
+            return
+
+        # 1. Analyze Centroid (Local now that we have embeddings in df_sp)
+        from autoSDM.analyzer import analyze_embeddings
+        res_c = analyze_embeddings(df_sp)
+        meta_c = {"method": "centroid", "centroid": res_c['centroid'].tolist(), "metrics": res_c['metrics']}
+        with open(os.path.join(sp_dir, "centroid.json"), 'w') as f: json.dump(meta_c, f)
+        
+        # 2. Analyze Maxent (GEE)
+        from autoSDM.trainer import train_maxent_model
+        nuisance_vars = args.nuisance_vars.split(',') if args.nuisance_vars else []
+        classifier, nuisance_optima, _, metrics = train_maxent_model(
+            df=df_sp, 
+            nuisance_vars=nuisance_vars, 
+            ecological_vars=[f"A{i:02d}" for i in range(64)], 
+            scale=args.scale
+        )
+        meta_m = {
+            "method": "maxent", "classifier_serialized": classifier.serialize(), 
+            "nuisance_optima": nuisance_optima, "ecological_vars": [f"A{i:02d}" for i in range(64)],
+            "nuisance_vars": nuisance_vars, "metrics": metrics
+        }
+        with open(os.path.join(sp_dir, "maxent.json"), 'w') as f: json.dump(meta_m, f)
+        
+        # 3. Ensemble Extrapolation (GEE)
+        from autoSDM.extrapolate import get_prediction_image
+        img_c, _ = get_prediction_image(meta_c, aoi=aoi)
+        img_m, _ = get_prediction_image(meta_m, aoi=aoi)
+        ensemble_img = img_c.select('similarity').multiply(img_m.select('similarity')).rename('similarity')
+        
+        ensemble_results = {
+            "species": sp,
+            "centroid_metrics": res_c['metrics'],
+            "maxent_metrics": metrics
+        }
+        with open(os.path.join(sp_dir, "ensemble_results.json"), 'w') as f:
+            json.dump(ensemble_results, f)
+        
+        if aoi and not args.view:
+            from autoSDM.extrapolate import download_mask
+            prefix = f"{sp}_ensemble"
+            sim_path = os.path.join(sp_dir, f"{prefix}_{args.scale}m.tif")
+            download_mask(ensemble_img, aoi, args.scale, sim_path)
+
+        sys.stderr.write(f"--- Completed: {sp} ---\n")
+    except Exception as e:
+        sys.stderr.write(f"--- Failed: {sp} | {e} ---\n")
+        import traceback
+        traceback.print_exc()
+
+def run_multi_species_pipeline(args, df, output_dir):
+    species_list = df[args.species_col].unique()
+    sys.stderr.write(f"--- Orchestrating Multi-Species Pipeline for {len(species_list)} species on GEE ---\n")
+    
+    # 1. Deduplicate coordinates for MASTER SAMPLING
+    sys.stderr.write("--- Deduplicating coordinates for Master Sampling ---\n")
+    unique_coords = df[['longitude', 'latitude', 'year']].drop_duplicates().copy()
+    sys.stderr.write(f"Unique coordinates to sample: {len(unique_coords)} (from {len(df)} total records)\n")
+    
+    import ee
+    # 2. Extract Embeddings ONCE for everyone
+    from autoSDM.trainer import _prepare_training_data
+    # We use a dummy nuisance var to satisfy the cleaner, or pass empty
+    # We extract A00-A63
+    master_data = _prepare_training_data(
+        unique_coords, 
+        nuisance_vars=[], 
+        ecological_vars=[f"A{i:02d}" for i in range(64)], 
+        class_property=None, # Not needed for sampling
+        scale=args.scale
+    )
+    
+    # Download sampled embeddings to local df for fast partitioning
+    sys.stderr.write("Downloading sampled embeddings from GEE for local partitioning...\n")
+    emb_cols = [f"A{i:02d}" for i in range(64)]
+    sample_res = master_data['fc'].reduceColumns(
+        reducer=ee.Reducer.toList().repeat(64 + 3), # embs + lat/lon/year
+        selectors=emb_cols + ['longitude', 'latitude', 'year']
+    ).getInfo()
+    
+    master_sampled_df = pd.DataFrame(sample_res['list']).T
+    master_sampled_df.columns = emb_cols + ['longitude', 'latitude', 'year']
+    sys.stderr.write(f"Master sampled data size: {len(master_sampled_df)}\n")
+
+    aoi = None
+    if args.lat is not None and args.lon is not None and args.radius is not None:
+        aoi = ee.Geometry.Point([args.lon, args.lat]).buffer(args.radius)
+    elif args.aoi_path:
+        import geopandas as gpd
+        gdf = gpd.read_file(args.aoi_path)
+        if gdf.crs and gdf.crs.to_epsg() != 4326: gdf = gdf.to_crs(epsg=4326)
+        bounds = gdf.total_bounds
+        aoi = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+    
+    # Run in parallel blocks of concurrent GEE requests.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
+        for sp in species_list:
+            df_sp = df[df[args.species_col] == sp]
+            futures.append(executor.submit(process_species_task, sp, df_sp, output_dir, args, aoi, master_sampled_df))
+        
+        concurrent.futures.wait(futures)
 
 def main():
     parser = argparse.ArgumentParser(description="autoSDM CLI")
@@ -28,15 +143,16 @@ def main():
     parser.add_argument("--gcs-bucket", help="GCS bucket name for server-side export (bypasses local download)")
     parser.add_argument("--wait", action="store_true", help="Wait for the export task(s) to complete and show progress updates.")
     parser.add_argument("--zip", action="store_true", help="Zip the output rasters (only for local download mode).")
-    parser.add_argument("--method", choices=["centroid", "maxent"], default="centroid", help="Mapping method: 'centroid' (presence-only) or 'maxent' (Maxent).")
+    parser.add_argument("--method", choices=["centroid", "maxent", "ensemble"], default="centroid", help="Mapping method: 'centroid' (presence-only), 'maxent' (Maxent), or 'ensemble' (Multi-species full pipeline).")
     parser.add_argument("--nuisance-vars", help="Comma-separated list of columns to treat as nuisance variables.")
     parser.add_argument("--prefix", help="Prefix for output raster filenames (default: 'prediction_map')")
     parser.add_argument("--only-similarity", action="store_true", help="Only generate/download similarity map (skip masks)")
     parser.add_argument("--lat", type=float, help="Latitude for AOI center")
     parser.add_argument("--lon", type=float, help="Longitude for AOI center")
     parser.add_argument("--radius", type=float, help="Radius (in meters) for AOI")
+    parser.add_argument("--species-col", help="Column name for species in multi-species mode.")
     
-    parser.add_argument("--background-method", choices=["sample_extent", "buffer"], help="Method to generate background points if presence-only data is provided.")
+    parser.add_argument("--background-method", choices=["sample_extent", "buffer", "none"], help="Method to generate background points if presence-only data is provided.")
     parser.add_argument("--background-buffer", nargs=2, type=float, help="Min and Max distance (in meters) for buffer-based background sampling. e.g. --background-buffer 100 1000")
     parser.add_argument("--cv", action="store_true", help="Run 5-fold Spatial Block Cross-Validation.")
     
@@ -57,6 +173,15 @@ def main():
         
     elif args.mode == "analyze":
         df = pd.read_csv(args.input)
+        
+        # Multi-Species Orchestration (Shifted from R to GEE)
+        if args.species_col and args.method == "ensemble":
+            import ee
+            try: ee.Initialize(project=args.project) if args.project else ee.Initialize()
+            except: pass
+            run_multi_species_pipeline(args, df, args.output)
+            sys.exit(0)
+
         import ee
         try:
             ee.Initialize(project=args.project) if args.project else ee.Initialize()
@@ -153,12 +278,20 @@ def main():
         # Point Prediction Mode
         df = pd.read_csv(args.input)
         
-        # 1. Extract Embeddings for these specific points
-        extractor = GEEExtractor(args.key, project=args.project)
-        df_emb = extractor.extract_embeddings(df, scale=args.scale)
+        # Check if embeddings are already present
+        emb_cols = [f"A{i:02d}" for i in range(64)]
+        has_embeddings = all(col in df.columns for col in emb_cols)
+        
+        if has_embeddings:
+            sys.stderr.write("Using existing embeddings from input CSV.\n")
+            df_emb = df
+        else:
+            # 1. Extract Embeddings for these specific points
+            extractor = GEEExtractor(args.key, project=args.project)
+            df_emb = extractor.extract_embeddings(df, scale=args.scale)
         
         if df_emb.empty:
-            sys.stderr.write("Error: Point extraction returned no data.\n")
+            sys.stderr.write("Error: Point extraction returned no data or input was empty.\n")
             sys.exit(1)
             
         # 2. Load Metadata
@@ -201,24 +334,78 @@ def main():
             nuisance_vars = meta['nuisance_vars']
             nuisance_optima = meta['nuisance_optima']
             
-            # Create FeatureCollection for the points with optimal nuisance values
-            features = []
-            for idx, row in df_emb.iterrows():
-                props = {v: float(row[v]) for v in ecological_vars if v in row}
-                for v, opt in nuisance_optima.items():
-                    props[v] = float(opt)
-                geom = ee.Geometry.Point([row['longitude'], row['latitude']])
-                features.append(ee.Feature(geom, props).set('orig_index', str(idx)))
+            # OPTIMIZATION: Use MultiPoint geometries for prediction points too.
+            # This drastically reduces payload size compared to list of Features.
             
-            fc = ee.FeatureCollection(features)
+            # Prediction points usually don't have differing nuisance vals (we use optima).
+            props = {}
+            for v, opt in nuisance_optima.items():
+                props[v] = float(opt)
+                
+            # Extract all coordinates
+            coords = df_emb[['longitude', 'latitude']].values.tolist()
             
-            from autoSDM.trainer import get_safe_scores_and_labels
-            scores, orig_indices = get_safe_scores_and_labels(classifier, fc, 'orig_index', name="Maxent Prediction")
-            
-            # Map scores back to df_emb
+            # Reduce chunk size to avoid "Computation timed out" with heavy classifier.
+            # 500 points should serve well within the 5-min interactive limit.
+            chunk_size = 500
+            total_scored = 0
             df_emb['similarity'] = np.nan
-            for s, idx_str in zip(scores, orig_indices):
-                df_emb.at[int(float(idx_str)), 'similarity'] = s
+            
+            # Helper to process a slice
+            def process_chunk(sub_df):
+                features = []
+                chunk_indices = []
+                for idx, row in sub_df.iterrows():
+                    p = {v: float(row[v]) for v in ecological_vars if v in row}
+                    p.update(props)
+                    geom = ee.Geometry.Point([row['longitude'], row['latitude']])
+                    features.append(ee.Feature(geom, p).set('orig_index', str(idx)))
+                    chunk_indices.append(idx)
+                
+                fc = ee.FeatureCollection(features)
+                from autoSDM.trainer import get_safe_scores_and_labels
+                return get_safe_scores_and_labels(classifier, fc, 'orig_index', name="Maxent Prediction")
+
+            idx = 0
+            while idx < len(df_emb):
+                current_chunk_size = chunk_size
+                success = False
+                
+                # Dynamic retries with smaller chunks if timeouts occur
+                for attempt in range(3):
+                    end_idx = min(idx + current_chunk_size, len(df_emb))
+                    chunk = df_emb.iloc[idx : end_idx]
+                    
+                    try:
+                        scores, orig_indices = process_chunk(chunk)
+                        
+                        count_in_chunk = 0
+                        for s, idx_str in zip(scores, orig_indices):
+                            if idx_str:
+                                df_emb.at[int(float(idx_str)), 'similarity'] = s
+                                count_in_chunk += 1
+                        
+                        total_scored += count_in_chunk
+                        sys.stderr.write(f"Scored {count_in_chunk} points (idx {idx}-{end_idx}).\n")
+                        idx += current_chunk_size
+                        success = True
+                        break
+                    except Exception as e:
+                        err = str(e)
+                        if "timed out" in err or "time out" in err:
+                            sys.stderr.write(f"Timeout processing chunk {idx}-{end_idx}. Retrying with smaller batch...\n")
+                            current_chunk_size = max(10, current_chunk_size // 4) # drastically reduce
+                        else:
+                            sys.stderr.write(f"Error processing chunk {idx}-{end_idx}: {e}\n")
+                            # If not a timeout (e.g. fatal error), skip this chunk? or retry?
+                            # For robustness, try smaller chunk too.
+                            current_chunk_size = max(10, current_chunk_size // 2)
+                
+                if not success:
+                    sys.stderr.write(f"Failed to process chunk starting at {idx} after retries. Skipping.\n")
+                    idx += chunk_size # Move on to prevent infinite loop
+            
+            sys.stderr.write(f"Maxent prediction: scored {total_scored}/{len(df_emb)} points.\n")
 
         # 5. Save Results
         os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)

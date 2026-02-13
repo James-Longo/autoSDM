@@ -8,10 +8,11 @@
 #' @param coords A character vector of length 2 specifying the longitude and latitude columns IN ORDER: c(longitude_col, latitude_col). Note: Longitude first, then Latitude!
 #' @param year A character string specifying the year or date column.
 #' @param presence Optional. A character string specifying the presence/absence column (values should be 0 or 1).
+#' @param species Optional. A character string specifying the species name column.
 #' @param nuisance_vars Optional. A character vector of column names to keep as nuisance variables (e.g., c("elevation", "aspect")).
 #' @return A standardized data frame ready for `autoSDM()` with lowercase column names.
 #' @export
-format_data <- function(data, coords, year, presence = NULL, nuisance_vars = NULL) {
+format_data <- function(data, coords, year, presence = NULL, species = NULL, nuisance_vars = NULL) {
     if (!is.data.frame(data)) {
         stop("Input 'data' must be a data frame.")
     }
@@ -36,7 +37,12 @@ format_data <- function(data, coords, year, presence = NULL, nuisance_vars = NUL
         stop(paste("Presence column not found:", presence))
     }
 
-    # 4. Nuisance Variables Validation
+    # 4. Species Validation
+    if (!is.null(species) && !species %in% names(data)) {
+        stop(paste("Species column not found:", species))
+    }
+
+    # 5. Nuisance Variables Validation
     if (!is.null(nuisance_vars)) {
         missing_nuisance <- setdiff(nuisance_vars, names(data))
         if (length(missing_nuisance) > 0) {
@@ -102,12 +108,17 @@ format_data <- function(data, coords, year, presence = NULL, nuisance_vars = NUL
         }
     }
 
-    # 7. Add presence column (lowercase "present")
+    # 8. Add presence column (lowercase "present")
     if (!is.null(presence)) {
         result$present <- as.numeric(data[[presence]])
     }
 
-    # 8. Add nuisance variables (lowercase names)
+    # 9. Add species column (lowercase "species")
+    if (!is.null(species)) {
+        result$species <- as.character(data[[species]])
+    }
+
+    # 10. Add nuisance variables (lowercase names)
     if (!is.null(nuisance_vars)) {
         for (nv in nuisance_vars) {
             # Create lowercase column name
@@ -116,7 +127,16 @@ format_data <- function(data, coords, year, presence = NULL, nuisance_vars = NUL
         }
     }
 
-    # 9. Filter to years with Alpha Earth data (2017+)
+    # 11. Preserve Alpha Earth Embeddings (A00-A63) if they exist
+    emb_cols <- sprintf("A%02d", 0:63)
+    available_embs <- intersect(emb_cols, names(data))
+    if (length(available_embs) > 0) {
+        for (ec in available_embs) {
+            result[[ec]] <- data[[ec]]
+        }
+    }
+
+    # 12. Filter to years with Alpha Earth data (2017+)
     rows_before <- nrow(result)
     result <- result[result$year >= 2017 & result$year <= 2025, ]
     rows_after <- nrow(result)
@@ -125,7 +145,7 @@ format_data <- function(data, coords, year, presence = NULL, nuisance_vars = NUL
         message(sprintf("Removed %d rows outside Alpha Earth coverage (2017-2025).", rows_before - rows_after))
     }
 
-    # 10. Remove rows with NA values
+    # 13. Remove rows with NA values
     rows_before <- nrow(result)
     result <- na.omit(result)
     rows_after <- nrow(result)
@@ -134,7 +154,7 @@ format_data <- function(data, coords, year, presence = NULL, nuisance_vars = NUL
         message(sprintf("Removed %d rows with missing values.", rows_before - rows_after))
     }
 
-    # 11. Remove duplicate rows
+    # 14. Remove duplicate rows
     rows_before <- nrow(result)
     result <- unique(result)
     rows_after <- nrow(result)
