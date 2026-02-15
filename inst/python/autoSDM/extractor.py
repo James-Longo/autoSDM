@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import ee
+import numpy as np
 
 class GEEExtractor:
     def __init__(self, json_key_path=None, project=None):
@@ -77,65 +78,61 @@ class GEEExtractor:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
         
-        chunk_size = 2000
+        chunk_size = 1000
         total_count = len(df)
         num_chunks = (total_count + chunk_size - 1) // chunk_size
-        max_workers = 8  # Parallel GEE requests
+        max_workers = 4  
         
-        sys.stderr.write(f"Processing {total_count} points across {len(years)} years in {num_chunks} chunks (size {chunk_size}, {max_workers} parallel)...\n")
+        sys.stderr.write(f"Processing {total_count} points in {num_chunks} chunks (size {chunk_size}, {max_workers} parallel)...\n")
         
-        # Thread-safe lock for updating the DataFrame
+        # Collect result dataframes to merge at the end
+        results_list = []
         df_lock = threading.Lock()
-        completed_count = [0]  # mutable counter
+        completed_count = [0]
         
         def process_chunk(chunk_idx, chunk_df):
-            """Process a single chunk: create FC, sampleRegions, return results."""
             try:
                 chunk_years = sorted(chunk_df['year'].unique())
-                results = []
+                chunk_extracted_data = []
                 
                 for yr in chunk_years:
                     yr_df = chunk_df[chunk_df['year'] == yr]
-                    if yr_df.empty:
-                        continue
+                    if yr_df.empty: continue
                     
-                    # Build lightweight FeatureCollection for this chunk
                     features = []
                     for idx, row in yr_df.iterrows():
-                        geom = ee.Geometry.Point([row['longitude'], row['latitude']])
-                        feat = ee.Feature(geom, {'orig_index': int(idx)})
-                        features.append(feat)
+                        # Proper aggregate mean: buffer the point into a 640m box
+                        geom = ee.Geometry.Point([row['longitude'], row['latitude']]).buffer(scale/2).bounds()
+                        features.append(ee.Feature(geom, {'orig_index': int(idx)}))
                     
-                    if not features:
-                        continue
+                    if not features: continue
                     fc = ee.FeatureCollection(features)
                     
-                    # Use sampleRegions — optimized for point extraction
                     img = ee.ImageCollection(asset_path)\
                         .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))\
                         .mosaic()
                     
-                    sampled = img.sampleRegions(
+                    # Compute mean of ALL land pixels in the box
+                    reduced = img.reduceRegions(
                         collection=fc,
-                        scale=scale,
-                        geometries=False  # Don't return geometry — saves bandwidth
+                        reducer=ee.Reducer.mean(),
+                        scale=10 # Native 10m scale ensures accuracy
                     )
                     
-                    res = sampled.getInfo()['features']
-                    results.extend(res)
-                
-                # Apply results back to the DataFrame
-                with df_lock:
-                    for feat in results:
+                    res = reduced.getInfo()['features']
+                    for feat in res:
                         props = feat['properties']
                         if 'A00' in props and props['A00'] is not None:
-                            idx = int(props['orig_index'])
-                            for k, v in props.items():
-                                if k != 'orig_index':
-                                    df.at[idx, k] = v
+                            chunk_extracted_data.append(props)
+                
+                if chunk_extracted_data:
+                    chunk_res_df = pd.DataFrame(chunk_extracted_data)
+                    with df_lock:
+                        results_list.append(chunk_res_df)
+                
+                with df_lock:
                     completed_count[0] += 1
                     sys.stderr.write(f"Completed chunk {completed_count[0]}/{num_chunks}\n")
-                    
             except Exception as e:
                 with df_lock:
                     completed_count[0] += 1
@@ -151,7 +148,19 @@ class GEEExtractor:
             
             # Wait for all to finish
             for f in as_completed(futures):
-                pass  # Errors are already logged inside process_chunk
+                pass
+        
+        # Prepare columns in main DataFrame if they don't exist
+        emb_cols = [f"A{i:02d}" for i in range(64)]
+        for col in emb_cols:
+            if col not in df.columns:
+                df[col] = np.nan
+        
+        # Batch update the main DataFrame
+        if results_list:
+            # Drop duplicates in results if any (though orig_index should be unique)
+            final_updates = pd.concat(results_list).drop_duplicates(subset='orig_index').set_index('orig_index')
+            df.update(final_updates)
         
         # Post-processing: Drop failed rows
         emb_cols = [f"A{i:02d}" for i in range(64)]

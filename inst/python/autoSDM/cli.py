@@ -19,45 +19,42 @@ def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df):
         os.makedirs(sp_dir, exist_ok=True)
         
         # 0. Merge master embeddings into this species dataframe
-        # Join on longitude, latitude, year
         df_sp = pd.merge(df_sp, master_sampled_df, on=['longitude', 'latitude', 'year'], how='inner')
         
         if df_sp.empty:
             sys.stderr.write(f"--- Warning: No valid points for {sp} after embedding merge ---\n")
             return
 
-        # 1. Analyze Centroid (Local now that we have embeddings in df_sp)
-        from autoSDM.analyzer import analyze_embeddings
-        res_c = analyze_embeddings(df_sp)
-        meta_c = {"method": "centroid", "centroid": res_c['centroid'].tolist(), "metrics": res_c['metrics']}
-        with open(os.path.join(sp_dir, "centroid.json"), 'w') as f: json.dump(meta_c, f)
-        
-        # 2. Analyze Maxent (GEE)
-        from autoSDM.trainer import train_maxent_model
-        nuisance_vars = args.nuisance_vars.split(',') if args.nuisance_vars else []
-        classifier, nuisance_optima, _, metrics = train_maxent_model(
-            df=df_sp, 
-            nuisance_vars=nuisance_vars, 
-            ecological_vars=[f"A{i:02d}" for i in range(64)], 
-            scale=args.scale
-        )
-        meta_m = {
-            "method": "maxent", "classifier_serialized": classifier.serialize(), 
-            "nuisance_optima": nuisance_optima, "ecological_vars": [f"A{i:02d}" for i in range(64)],
-            "nuisance_vars": nuisance_vars, "metrics": metrics
-        }
-        with open(os.path.join(sp_dir, "maxent.json"), 'w') as f: json.dump(meta_m, f)
-        
-        # 3. Ensemble Extrapolation (GEE)
+        from autoSDM.analyzer import analyze_ridge, analyze_knn
         from autoSDM.extrapolate import get_prediction_image
-        img_c, _ = get_prediction_image(meta_c, aoi=aoi)
-        img_m, _ = get_prediction_image(meta_m, aoi=aoi)
-        ensemble_img = img_c.select('similarity').multiply(img_m.select('similarity')).rename('similarity')
+        
+        # 1. Ridge
+        res_r = analyze_ridge(df_sp)
+        meta_r = {"method": "ridge", "weights": res_r['weights'], "intercept": res_r['intercept'], "metrics": res_r['metrics']}
+        with open(os.path.join(sp_dir, "ridge.json"), 'w') as f: json.dump(meta_r, f)
+        
+        # 2. kNN k=1
+        res_k1 = analyze_knn(df_sp, k=1)
+        meta_k1 = {"method": "knn", "train_X": res_k1['train_X'].tolist(), "train_y": res_k1['train_y'].tolist(), "k": 1, "metrics": res_k1['metrics']}
+        with open(os.path.join(sp_dir, "knn1.json"), 'w') as f: json.dump(meta_k1, f)
+        
+        # 3. kNN k=3
+        res_k3 = analyze_knn(df_sp, k=3)
+        meta_k3 = {"method": "knn", "train_X": res_k3['train_X'].tolist(), "train_y": res_k3['train_y'].tolist(), "k": 3, "metrics": res_k3['metrics']}
+        with open(os.path.join(sp_dir, "knn3.json"), 'w') as f: json.dump(meta_k3, f)
+        
+        # Ensemble Prediction Map
+        img_r, _ = get_prediction_image(meta_r, aoi=aoi)
+        img_k1, _ = get_prediction_image(meta_k1, aoi=aoi)
+        img_k3, _ = get_prediction_image(meta_k3, aoi=aoi)
+        
+        ensemble_img = img_r.select('similarity').multiply(img_k1.select('similarity')).multiply(img_k3.select('similarity')).rename('similarity')
         
         ensemble_results = {
             "species": sp,
-            "centroid_metrics": res_c['metrics'],
-            "maxent_metrics": metrics
+            "ridge_metrics": res_r['metrics'],
+            "knn1_metrics": res_k1['metrics'],
+            "knn3_metrics": res_k3['metrics']
         }
         with open(os.path.join(sp_dir, "ensemble_results.json"), 'w') as f:
             json.dump(ensemble_results, f)
@@ -135,15 +132,15 @@ def main():
     parser.add_argument("--key", help="Optional GEE service account key path. If not provided, uses existing session auth.")
     parser.add_argument("--project", help="Google Cloud Project ID for Earth Engine initialization.")
     parser.add_argument("--aoi-path", help="Path to GeoJSON or Shapefile (polygon) for mapping extent.")
-    parser.add_argument("--meta", help="Path to meta JSON (for extrapolate/ensemble mode)")
-    parser.add_argument("--meta2", help="Path to second meta JSON (for ensemble mode)")
+    parser.add_argument("--meta", nargs='+', help="Path to meta JSON(s) (for extrapolate/ensemble mode)")
+    parser.add_argument("--meta2", help="DEPRECATED: Use multiple paths in --meta instead")
     parser.add_argument("--coarse-meta", help="Path to coarse meta JSON (for filtering 10m output)")
     parser.add_argument("--scale", type=int, default=10, help="Scale in meters (default: 10)")
     parser.add_argument("--view", action="store_true", help="Generate a web map for visualization instead of downloading GeoTIFFs.")
     parser.add_argument("--gcs-bucket", help="GCS bucket name for server-side export (bypasses local download)")
     parser.add_argument("--wait", action="store_true", help="Wait for the export task(s) to complete and show progress updates.")
     parser.add_argument("--zip", action="store_true", help="Zip the output rasters (only for local download mode).")
-    parser.add_argument("--method", choices=["centroid", "maxent", "ensemble"], default="centroid", help="Mapping method: 'centroid' (presence-only), 'maxent' (Maxent), or 'ensemble' (Multi-species full pipeline).")
+    parser.add_argument("--method", choices=["centroid", "maxent", "ridge", "knn", "mean", "ensemble"], default="centroid", help="Mapping method.")
     parser.add_argument("--nuisance-vars", help="Comma-separated list of columns to treat as nuisance variables.")
     parser.add_argument("--prefix", help="Prefix for output raster filenames (default: 'prediction_map')")
     parser.add_argument("--only-similarity", action="store_true", help="Only generate/download similarity map (skip masks)")
@@ -151,6 +148,7 @@ def main():
     parser.add_argument("--lon", type=float, help="Longitude for AOI center")
     parser.add_argument("--radius", type=float, help="Radius (in meters) for AOI")
     parser.add_argument("--species-col", help="Column name for species in multi-species mode.")
+    parser.add_argument("--k", type=int, help="Force a specific number of clusters for centroid analysis.")
     
     parser.add_argument("--background-method", choices=["sample_extent", "buffer", "none"], help="Method to generate background points if presence-only data is provided.")
     parser.add_argument("--background-buffer", nargs=2, type=float, help="Min and Max distance (in meters) for buffer-based background sampling. e.g. --background-buffer 100 1000")
@@ -159,6 +157,7 @@ def main():
     args = parser.parse_args()
     
     if args.mode == "extract":
+        # Coordinate-Centric Extraction 
         df = pd.read_csv(args.input)
         extractor = GEEExtractor(args.key, project=args.project)
         res = extractor.extract_embeddings(
@@ -189,8 +188,8 @@ def main():
             pass
 
         if args.method == "centroid":
-
-            res = analyze_embeddings(df)
+            from autoSDM.analyzer import analyze_embeddings
+            res = analyze_embeddings(df, forced_k=args.k)
             # Save similarities
             res['clean_data']['similarity'] = res['similarities']
             os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
@@ -199,7 +198,7 @@ def main():
             # Save metadata
             meta = {
                 "method": "centroid",
-                "centroid": res['centroid'].tolist(),
+                "centroids": [c.tolist() for c in res['centroids']],
                 "metrics": res['metrics'],
                 "cv_results": None
             }
@@ -264,6 +263,46 @@ def main():
                 "metrics": metrics,
                 "cv_results": cv_results
             }
+        elif args.method == "ridge":
+            from autoSDM.analyzer import analyze_ridge
+            res = analyze_ridge(df)
+            res['clean_data']['similarity'] = res['similarities']
+            os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
+            res['clean_data'].to_csv(args.output, index=False)
+            meta = {
+                "method": "ridge",
+                "weights": res['weights'],
+                "intercept": res['intercept'],
+                "metrics": res['metrics']
+            }
+        elif args.method == "knn":
+            from autoSDM.analyzer import analyze_knn
+            res = analyze_knn(df, k=args.k if args.k else 3)
+            res['clean_data']['similarity'] = res['similarities']
+            os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
+            res['clean_data'].to_csv(args.output, index=False)
+            meta = {
+                "method": "knn",
+                "train_X": res['train_X'].tolist(),
+                "train_y": res['train_y'].tolist(),
+                "k": res['k'],
+                "metrics": res['metrics']
+            }
+        elif args.method == "mean":
+            from autoSDM.analyzer import analyze_mean
+            res = analyze_mean(df)
+            res['clean_data']['similarity'] = res['similarities']
+            os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
+            res['clean_data'].to_csv(args.output, index=False)
+            meta = {
+                "method": "mean",
+                "centroid": res['centroid'],
+                "metrics": res['metrics']
+            }
+        elif args.method == "ensemble":
+            # Multi-species pipeline
+            run_multi_species_pipeline(args, df, args.output)
+            return # Skip standard save logic
 
         if args.output.endswith('.csv'):
             meta_path = args.output.replace('.csv', '.json')
@@ -308,20 +347,21 @@ def main():
             # Extract coarse embeddings for filtering
             df_coarse = extractor.extract_embeddings(df, scale=1000)
             if not df_coarse.empty:
-                coarse_centroid = np.array(coarse_meta['centroid'])
+                coarse_centroids = [np.array(c) for c in coarse_meta['centroids']]
                 coarse_emb_cols = [f"A{i:02d}" for i in range(64)]
-                coarse_sims = np.dot(df_coarse[coarse_emb_cols].values, coarse_centroid)
+                coarse_sim_matrix = np.dot(df_coarse[coarse_emb_cols].values, np.array(coarse_centroids).T)
+                coarse_sims = np.max(coarse_sim_matrix, axis=1)
                 
                 # Filter df_emb based on coarse threshold
                 valid_mask = coarse_sims >= coarse_meta.get('threshold_5pct', -1)
                 df_emb = df_emb[valid_mask].copy()
                 sys.stderr.write(f"Coarse filter dropped {np.sum(~valid_mask)} points.\n")
 
-        # 4. Run Predictions
         emb_cols = [f"A{i:02d}" for i in range(64)]
         if method == "centroid":
-            centroid = np.array(meta['centroid'])
-            df_emb['similarity'] = np.dot(df_emb[emb_cols].values, centroid)
+            centroids = [np.array(c) for c in meta['centroids']]
+            sim_matrix = np.dot(df_emb[emb_cols].values, np.array(centroids).T)
+            df_emb['similarity'] = np.max(sim_matrix, axis=1)
         
         elif method == "maxent":
             # Maxent requires GEE classification for the points
@@ -407,6 +447,31 @@ def main():
             
             sys.stderr.write(f"Maxent prediction: scored {total_scored}/{len(df_emb)} points.\n")
 
+        elif method == "ridge":
+            weights = np.array(meta['weights'])
+            intercept = meta['intercept']
+            df_emb['similarity'] = np.dot(df_emb[emb_cols].values, weights) + intercept
+            
+        elif method == "mean":
+            centroid = np.array(meta['centroid'])
+            df_emb['similarity'] = np.dot(df_emb[emb_cols].values, centroid)
+
+        elif method == "knn":
+            from sklearn.neighbors import KNeighborsClassifier
+            train_X = np.array(meta['train_X'])
+            train_y = np.array(meta['train_y'])
+            k = meta['k']
+            
+            knn = KNeighborsClassifier(n_neighbors=k, metric='euclidean')
+            knn.fit(train_X, train_y)
+            
+            # Predict probabilities
+            probs = knn.predict_proba(df_emb[emb_cols].values)
+            if probs.shape[1] > 1:
+                df_emb['similarity'] = probs[:, 1]
+            else:
+                df_emb['similarity'] = probs[:, 0] if train_y[0] == 1 else (1.0 - probs[:, 0])
+
         # 5. Save Results
         os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
         df_emb.to_csv(args.output, index=False)
@@ -455,19 +520,28 @@ def main():
             sys.stderr.write(f"AOI simplified to bounding box: {bounds}\n")
         
         if args.mode == "ensemble":
-            if not args.meta2:
-                sys.stderr.write("Error: --meta2 is required for ensemble mode.\n")
+            meta_paths = args.meta
+            if args.meta2: # Compatibility
+                meta_paths.append(args.meta2)
+            
+            if not meta_paths or len(meta_paths) < 1:
+                sys.stderr.write("Error: At least one --meta file required for ensemble/extrapolate mode.\n")
                 sys.exit(1)
-            with open(args.meta) as f:
-                meta1 = json.load(f)
-            with open(args.meta2) as f:
-                meta2 = json.load(f)
             
-            img1, aoi = get_prediction_image(meta1, df, coarse_filter=coarse_filter, aoi=aoi)
-            img2, _ = get_prediction_image(meta2, df, coarse_filter=coarse_filter, aoi=aoi)
+            prediction_map = None
+            for i, mp in enumerate(meta_paths):
+                with open(mp) as f:
+                    mdata = json.load(f)
+                
+                img_i, aoi_i = get_prediction_image(mdata, df, coarse_filter=coarse_filter, aoi=aoi)
+                if aoi is None: aoi = aoi_i
+                
+                if prediction_map is None:
+                    prediction_map = img_i.select('similarity')
+                else:
+                    prediction_map = prediction_map.multiply(img_i.select('similarity'))
             
-            # Ensemble: Product of similarities (Agreement)
-            prediction_map = img1.select('similarity').multiply(img2.select('similarity')).rename('similarity')
+            prediction_map = prediction_map.rename('similarity')
             thresholds = {}
         else:
             # Standard Extrapolate Mode

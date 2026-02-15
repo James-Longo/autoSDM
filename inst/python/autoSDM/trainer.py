@@ -4,6 +4,7 @@ import numpy as np
 import sys
 import os
 import json
+from autoSDM.analyzer import calculate_classifier_metrics
 
 def assign_spatial_folds(df, n_folds=5, grid_size=None):
     """
@@ -45,45 +46,6 @@ def assign_spatial_folds(df, n_folds=5, grid_size=None):
     
     return df
 
-def calculate_classifier_metrics(scores_pos, scores_all):
-    """
-    Calculates CBI and AUC for a set of scores.
-    """
-    from autoSDM.analyzer import calculate_cbi
-    cbi = calculate_cbi(scores_pos, scores_all)
-    
-    # AUC calculation
-    # For speed and robustness, use a simple rank-based AUC
-    # We need background scores
-    # scores_all contains pos scores. Background = all - pos.
-    # But wait, scores_all is the full set, scores_pos is a subset.
-    
-    n_pos = len(scores_pos)
-    n_all = len(scores_all)
-    n_bg = n_all - n_pos
-    
-    if n_bg > 0 and n_pos > 0:
-        # Wilcoxon-Mann-Whitney U statistic based AUC
-        from scipy.stats import mannwhitneyu
-        # Mann-Whitney U test between pos and bg scores
-        # We need the bg scores explicitly
-        # This is a bit tricky if we only have all and pos.
-        # Let's assume we can differentiate them by values if they are unique, 
-        # but better to pass them explicitly or handle correctly.
-        # Actually, in SDM, 'all' often means 'background' or 'presence + background'.
-        # If scores_all is ALL points (including presences), then:
-        
-        # Simple iterative AUC (slow for large N but correct)
-        # For CV we usually have small test sets, but let's be careful.
-        # Let's use a faster way:
-        ranks = pd.Series(scores_all).rank()
-        pos_rank_sum = ranks[np.isin(scores_all, scores_pos)].sum()
-        u_stat = pos_rank_sum - (n_pos * (n_pos + 1) / 2)
-        auc = u_stat / (n_pos * n_bg)
-    else:
-        auc = 0.5
-        
-    return {'cbi': cbi, 'auc': float(auc)}
 
 def _prepare_training_data(df, nuisance_vars, ecological_vars, class_property='present', scale=10):
     """
@@ -326,44 +288,108 @@ def train_maxent_model(df, nuisance_vars, ecological_vars, class_property='prese
     m_sims, m_labels = get_safe_scores_and_labels(classifier, data['fc'], data['class_property'], name="Maxent (Train)")
     
     if m_sims.size > 0:
-        metrics = calculate_classifier_metrics(m_sims[m_labels == 1], m_sims)
+        metrics = calculate_classifier_metrics(m_sims[m_labels == 1], m_sims[m_labels == 0])
     else:
-        metrics = {'cbi': 0.0, 'auc': 0.5}
+        metrics = {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0}
         
-    sys.stderr.write(f"Maxent Analysis: CBI={metrics['cbi']:.4f}, AUC={metrics['auc']:.4f}\n")
+    sys.stderr.write(f"Maxent Analysis: CBI={metrics['cbi']:.4f}, AUC-ROC={metrics['auc_roc']:.4f}, AUC-PR={metrics['auc_pr']:.4f}\n")
 
     return classifier, data['nuisance_optima'], data['df_clean'], metrics
 
-def train_centroid_model(df, class_property='present', scale=10):
+def train_centroid_model(df, class_property='present', scale=10, forced_k=None):
     """
-    Calculates the species centroid without needing local embeddings.
-    Samples presence points from GEE and calculates the geometric median.
+    Calculates one or more species centroids based on embedding clusters.
+    If forced_k is provided, it skips picky detection and returns exactly k clusters.
     """
-    # Use _prepare_training_data to handle coord upload and sampling
+    from scipy.cluster.vq import kmeans2
+    from autoSDM.analyzer import geometric_median, calculate_cbi
+
+    # 1. Prepare and Sample Training Data
     data = _prepare_training_data(df, nuisance_vars=[], ecological_vars=[f"A{i:02d}" for i in range(64)], class_property=class_property, scale=scale)
     
     # Filter for presence points only
     presence_fc = data['fc'].filter(ee.Filter.eq(data['class_property'], 1))
     
-    # Get embeddings for centroid calculation
-    # We limit this to 5000 points to avoid timeout/memory issues
+    # Get embeddings for clustering and centroid calculation
     emb_cols = [f"A{i:02d}" for i in range(64)]
     res = presence_fc.limit(5000).reduceColumns(
         reducer=ee.Reducer.toList().repeat(64),
         selectors=emb_cols
     ).getInfo()
     
-    # List of lists -> array
     embs = np.array(res['list']).T
-    
     if embs.size == 0:
         raise ValueError("No presence points found after GEE sampling for centroid.")
-        
-    from autoSDM.analyzer import geometric_median, calculate_cbi
-    centroid = geometric_median(embs)
+
+    # 2. Centroid Detection
+    best_centroids = []
     
-    # Calculate similarities and metrics (on sampled points)
-    # Get all sampled embeddings
+    if forced_k is not None:
+        sys.stderr.write(f"Multi-Centroid: FORCING k={forced_k}\n")
+        if forced_k == 1:
+            best_centroids = [geometric_median(embs)]
+        else:
+            try:
+                centers, labels = kmeans2(embs, k=forced_k, minit='points', iter=20, missing='warn')
+                for i in range(forced_k):
+                    pts = embs[labels == i]
+                    if len(pts) > 0:
+                        best_centroids.append(geometric_median(pts))
+                    else:
+                        # Fallback if a cluster is empty (unlikely with minit='points')
+                        best_centroids.append(geometric_median(embs))
+            except Exception as e:
+                sys.stderr.write(f"Warning: Forced k={forced_k} failed: {e}. Falling back to k=1.\n")
+                best_centroids = [geometric_median(embs)]
+    else:
+        # Picky Multi-Centroid Detection
+        # Base: k=1
+        c1 = geometric_median(embs)
+        wss1 = np.sum(np.linalg.norm(embs - c1, axis=1)**2)
+        best_centroids = [c1]
+        
+        # Try k=2
+        if len(embs) > 50:
+            try:
+                c2_centers, c2_labels = kmeans2(embs, k=2, minit='points', iter=20, missing='warn')
+                wss2 = 0
+                clusters = []
+                for i in range(2):
+                    cluster_pts = embs[c2_labels == i]
+                    if len(cluster_pts) > 0:
+                        c_med = geometric_median(cluster_pts)
+                        wss2 += np.sum(np.linalg.norm(cluster_pts - c_med, axis=1)**2)
+                        clusters.append({'median': c_med, 'count': len(cluster_pts)})
+                
+                if len(clusters) == 2:
+                    mass_ok = all(c['count'] / len(embs) >= 0.15 for c in clusters)
+                    dist = np.linalg.norm(clusters[0]['median'] - clusters[1]['median'])
+                    if wss2 < 0.75 * wss1 and mass_ok and dist > 0.5:
+                        sys.stderr.write(f"Multi-Centroid: Detected 2 distinct habitats (WSS red: {wss2/wss1:.2f}, dist: {dist:.2f}).\n")
+                        best_centroids = [c['median'] for c in clusters]
+                        
+                        # Try k=3
+                        c3_centers, c3_labels = kmeans2(embs, k=3, minit='points', iter=20, missing='warn')
+                        wss3 = 0
+                        clusters3 = []
+                        for i in range(3):
+                            cluster_pts = embs[c3_labels == i]
+                            if len(cluster_pts) > 0:
+                                c_med = geometric_median(cluster_pts)
+                                wss3 += np.sum(np.linalg.norm(cluster_pts - c_med, axis=1)**2)
+                                clusters3.append({'median': c_med, 'count': len(cluster_pts)})
+                        
+                        if len(clusters3) == 3:
+                            mass_ok3 = all(c['count'] / len(embs) >= 0.10 for c in clusters3)
+                            dists = [np.linalg.norm(clusters3[i]['median'] - clusters3[j]['median']) for i,j in [(0,1), (1,2), (0,2)]]
+                            if wss3 < 0.80 * wss2 and mass_ok3 and min(dists) > 0.4:
+                                sys.stderr.write(f"Multi-Centroid: Detected 3 distinct habitats.\n")
+                                best_centroids = [c['median'] for c in clusters3]
+            except Exception as e:
+                sys.stderr.write(f"Warning: Multi-Centroid clustering failed: {e}. Falling back to single centroid.\n")
+
+    # 3. Calculate metrics using Max-Similarity across centroids
+    # Get all sampled embeddings (presence + background) for validation
     all_res = data['fc'].limit(10000).reduceColumns(
         reducer=ee.Reducer.toList().repeat(65),
         selectors=emb_cols + [data['class_property']]
@@ -372,25 +398,15 @@ def train_centroid_model(df, class_property='present', scale=10):
     all_embs = np.array(all_res['list'][:64]).T
     all_labels = np.array(all_res['list'][64])
     
-    similarities = np.dot(all_embs, centroid)
-    metrics = {
-        'cbi': calculate_cbi(similarities[all_labels == 1], similarities),
-        'auc': 0.5 # Simplified AUC for centroid
-    }
+    # Score = max dot product profile across all detected centroids
+    sim_matrix = np.dot(all_embs, np.array(best_centroids).T)
+    similarities = np.max(sim_matrix, axis=1)
     
-    if np.any(all_labels == 0):
-        # Calculate AUC if background points exist in the sample
-        pos = similarities[all_labels == 1]
-        neg = similarities[all_labels == 0]
-        auc = 0
-        for p in pos:
-            auc += np.sum(p > neg)
-            auc += 0.5 * np.sum(p == neg)
-        metrics['auc'] = float(auc / (len(pos) * len(neg)))
+    metrics = calculate_classifier_metrics(similarities[all_labels == 1], similarities[all_labels == 0])
 
-    sys.stderr.write(f"Centroid Analysis: CBI={metrics['cbi']:.4f}, AUC={metrics['auc']:.4f}\n")
+    sys.stderr.write(f"Multi-Centroid Analysis ({len(best_centroids)} centroids): CBI={metrics['cbi']:.4f}, AUC-ROC={metrics['auc_roc']:.4f}, AUC-PR={metrics['auc_pr']:.4f}\n")
     
-    return centroid, metrics
+    return best_centroids, metrics
 
 def run_cv_fold(fold_idx, df, nuisance_vars, ecological_vars, class_property, scale):
     import ee
@@ -401,9 +417,11 @@ def run_cv_fold(fold_idx, df, nuisance_vars, ecological_vars, class_property, sc
     # Centroid
     from autoSDM.analyzer import analyze_embeddings
     c_res = analyze_embeddings(train_df, class_property=class_property)
+    # Correctly handle multi-centroids in CV
     t_emb = test_df[[f"A{i:02d}" for i in range(64)]].values
-    c_sims = np.dot(t_emb, c_res['centroid'])
-    c_metrics = calculate_classifier_metrics(c_sims[test_df[class_property] == 1], c_sims)
+    c_sim_matrix = np.dot(t_emb, np.array(c_res['centroids']).T)
+    c_sims = np.max(c_sim_matrix, axis=1)
+    c_metrics = calculate_classifier_metrics(c_sims[test_df[class_property] == 1], c_sims[test_df[class_property] == 0])
     
     # Maxent
     m_data = _prepare_training_data(train_df, nuisance_vars, ecological_vars, class_property, scale=scale)
@@ -413,7 +431,7 @@ def run_cv_fold(fold_idx, df, nuisance_vars, ecological_vars, class_property, sc
     m_sims, m_labels = get_safe_scores_and_labels(m_clf, t_data['fc'], t_data['class_property'], name=f"Maxent (Fold {fold_idx})")
     
     if m_sims.size > 0:
-        # We need to align c_sims with m_sims because m_sims might have been filtered for NAs
+        m_metrics = calculate_classifier_metrics(m_sims[m_labels == 1], m_sims[m_labels == 0])
         # Actually, t_data['fc'] was created from test_df, but filtered for null embeddings.
         # We should ideally align them by index if we want ensemble properly.
         # For now, let's assume they are somewhat aligned or just warn if size differs.
@@ -450,9 +468,9 @@ def run_parallel_cv(df, nuisance_vars, ecological_vars, class_property='present'
     
     if not res:
         sys.stderr.write("Warning: All CV folds failed or returned no data.\n")
-        return {m: {'cbi': 0.0, 'auc': 0.5} for m in ['centroid', 'maxent', 'ensemble']}
+        return {m: {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0} for m in ['centroid', 'maxent', 'ensemble']}
     
     avg = {}
     for m in ['centroid', 'maxent', 'ensemble']:
-        avg[m] = {met: float(np.mean([r[m][met] for r in res])) for met in ['cbi', 'auc']}
+        avg[m] = {met: float(np.mean([r[m][met] for r in res])) for met in ['cbi', 'auc_roc', 'auc_pr']}
     return avg
