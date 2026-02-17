@@ -78,10 +78,10 @@ class GEEExtractor:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
         
-        chunk_size = 1000
+        chunk_size = 2000
         total_count = len(df)
         num_chunks = (total_count + chunk_size - 1) // chunk_size
-        max_workers = 4  
+        max_workers = 5  
         
         sys.stderr.write(f"Processing {total_count} points in {num_chunks} chunks (size {chunk_size}, {max_workers} parallel)...\n")
         
@@ -92,31 +92,30 @@ class GEEExtractor:
         
         def process_chunk(chunk_idx, chunk_df):
             try:
-                chunk_years = sorted(chunk_df['year'].unique())
                 chunk_extracted_data = []
-                
-                for yr in chunk_years:
-                    yr_df = chunk_df[chunk_df['year'] == yr]
+                # Group by year to minimize ImageCollection filtering
+                for yr, yr_df in chunk_df.groupby("year"):
                     if yr_df.empty: continue
                     
+                    # Efficient feature creation
                     features = []
+                    half_s = scale / 2
                     for idx, row in yr_df.iterrows():
-                        # Proper aggregate mean: buffer the point into a 640m box
+                        # exact buffer/bounds for publication quality
                         geom = ee.Geometry.Point([row['longitude'], row['latitude']]).buffer(scale/2).bounds()
                         features.append(ee.Feature(geom, {'orig_index': int(idx)}))
                     
-                    if not features: continue
                     fc = ee.FeatureCollection(features)
                     
                     img = ee.ImageCollection(asset_path)\
                         .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))\
                         .mosaic()
                     
-                    # Compute mean of ALL land pixels in the box
+                    # Force native 10m scale for the reduction to ensure every pixel is counted
                     reduced = img.reduceRegions(
                         collection=fc,
                         reducer=ee.Reducer.mean(),
-                        scale=10 # Native 10m scale ensures accuracy
+                        scale=10 
                     )
                     
                     res = reduced.getInfo()['features']
@@ -132,22 +131,25 @@ class GEEExtractor:
                 
                 with df_lock:
                     completed_count[0] += 1
-                    sys.stderr.write(f"Completed chunk {completed_count[0]}/{num_chunks}\n")
+                    percent = (completed_count[0] / num_chunks) * 100
+                    sys.stderr.write(f"\rProgress: {percent:.1f}% ({completed_count[0]}/{num_chunks} chunks)")
+                    sys.stderr.flush()
+                    if completed_count[0] == num_chunks:
+                        sys.stderr.write("\n")
             except Exception as e:
                 with df_lock:
                     completed_count[0] += 1
-                sys.stderr.write(f"Error in chunk {chunk_idx}: {e}\n")
+                sys.stderr.write(f"\nError in chunk {chunk_idx}: {e}\n")
         
         # Submit all chunks concurrently
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
+            chunk_futures = []
             for i in range(0, total_count, chunk_size):
                 chunk_df = df.iloc[i : i + chunk_size].copy()
                 chunk_idx = i // chunk_size + 1
-                futures.append(executor.submit(process_chunk, chunk_idx, chunk_df))
+                chunk_futures.append(executor.submit(process_chunk, chunk_idx, chunk_df))
             
-            # Wait for all to finish
-            for f in as_completed(futures):
+            for f in as_completed(chunk_futures):
                 pass
         
         # Prepare columns in main DataFrame if they don't exist
