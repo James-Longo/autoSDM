@@ -237,53 +237,6 @@ def analyze_ridge(df, class_property='present'):
     res_meta['metrics'] = calculate_classifier_metrics(pos_scores, neg_scores)
     
     return res_meta
-
-def analyze_knn(df, k=3, class_property='present'):
-    """
-    k-Nearest Neighbors (kNN) using Euclidean distance.
-    Returns majority vote (0 or 1) as similarity score.
-    Note: For SDM comparison, we use the probability of presence as the suitability score.
-    """
-    from sklearn.neighbors import KNeighborsClassifier
-    import sys
-
-    emb_cols = [f"A{i:02d}" for i in range(64)]
-    df_clean = df.dropna(subset=emb_cols + [class_property]).copy()
-    
-    X = df_clean[emb_cols].values
-    y = df_clean[class_property].values
-    
-    # The paper uses L2 distance (Euclidean)
-    model = KNeighborsClassifier(n_neighbors=k, metric='euclidean')
-    model.fit(X, y)
-    
-    # suitability = probability of class 1
-    # If the user wants "assigns that label", it would be 0 or 1.
-    # But for ROC/PR/CBI metrics, we need a continuous score. 
-    # probalities provide n_neighbors levels of score.
-    probs = model.predict_proba(X)
-    # Check if both classes are present
-    if probs.shape[1] > 1:
-        similarities = probs[:, 1]
-    else:
-        # Only one class present in training? Unlikely for kNN SDM
-        similarities = probs[:, 0] if y[0] == 1 else (1.0 - probs[:, 0])
-        
-    df_clean['similarity'] = similarities
-    
-    res_meta = {
-        "train_X": X, # In reality we'd save this or aKDTree
-        "train_y": y,
-        "k": k,
-        "similarities": similarities,
-        "clean_data": df_clean,
-        "metrics": {}
-    }
-    
-    pos_scores = df_clean[df_clean[class_property] == 1]['similarity'].values
-    neg_scores = df_clean[df_clean[class_property] == 0]['similarity'].values
-    res_meta['metrics'] = calculate_classifier_metrics(pos_scores, neg_scores)
-    
     return res_meta
     
 def analyze_mean(df, class_property='present'):

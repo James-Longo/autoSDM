@@ -154,7 +154,7 @@ def main():
     parser.add_argument("--gcs-bucket", help="GCS bucket name for server-side export (bypasses local download)")
     parser.add_argument("--wait", action="store_true", help="Wait for the export task(s) to complete and show progress updates.")
     parser.add_argument("--zip", action="store_true", help="Zip the output rasters (only for local download mode).")
-    parser.add_argument("--method", choices=["centroid", "ridge", "knn", "mean", "ensemble"], default="centroid", help="Modeling method. Use 'ridge' for presence-absence and 'centroid' for presence-only.")
+    parser.add_argument("--method", choices=["centroid", "ridge", "mean", "ensemble"], default="centroid", help="Modeling method. Use 'ridge' for presence-absence and 'centroid' for presence-only.")
     parser.add_argument("--prefix", help="Prefix for output raster filenames (default: 'prediction_map')")
     parser.add_argument("--only-similarity", action="store_true", help="Only generate/download similarity map (skip masks)")
     parser.add_argument("--lat", type=float, help="Latitude for AOI center")
@@ -289,19 +289,6 @@ def main():
                 "intercept": res['intercept'],
                 "metrics": res['metrics']
             }
-        elif args.method == "knn":
-            from autoSDM.analyzer import analyze_knn
-            res = analyze_knn(df, k=3)
-            res['clean_data']['similarity'] = res['similarities']
-            os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-            res['clean_data'].to_csv(args.output, index=False)
-            meta = {
-                "method": "knn",
-                "train_X": res['train_X'].tolist(),
-                "train_y": res['train_y'].tolist(),
-                "k": res['k'],
-                "metrics": res['metrics']
-            }
         elif args.method == "mean":
             from autoSDM.analyzer import analyze_mean
             res = analyze_mean(df)
@@ -388,21 +375,6 @@ def main():
             centroid = np.array(meta['centroid'])
             df_emb['similarity'] = np.dot(df_emb[emb_cols].values, centroid)
 
-        elif method == "knn":
-            from sklearn.neighbors import KNeighborsClassifier
-            train_X = np.array(meta['train_X'])
-            train_y = np.array(meta['train_y'])
-            k = meta['k']
-            
-            knn = KNeighborsClassifier(n_neighbors=k, metric='euclidean')
-            knn.fit(train_X, train_y)
-            
-            # Predict probabilities
-            probs = knn.predict_proba(df_emb[emb_cols].values)
-            if probs.shape[1] > 1:
-                df_emb['similarity'] = probs[:, 1]
-            else:
-                df_emb['similarity'] = probs[:, 0] if train_y[0] == 1 else (1.0 - probs[:, 0])
 
         # 5. Save Results
         os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)

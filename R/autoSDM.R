@@ -126,8 +126,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
       out_csv <- file.path(output_dir, paste0(m_clean, ".csv"))
       out_json <- file.path(output_dir, paste0(m_clean, ".json"))
       
-      # Determine specific method for Python
-      py_method <- if (grepl("^knn", m)) "knn" else m
+      py_method <- m
       
       system2(python_path, args = c(
         "-m", "autoSDM.cli", "analyze", 
@@ -169,8 +168,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
       point_preds$similarity <- 1.0
 
       for (m in methods) {
-        json_name <- if (grepl("^knn", m)) paste0(m, ".json") else paste0(m, ".json")
-        meta_p <- file.path(output_dir, json_name)
+        meta_p <- file.path(output_dir, paste0(m, ".json"))
         if (file.exists(meta_p)) {
           preds <- predict_at_coords(pred_embedded, analysis_meta_path = meta_p, scale = scale, python_path = python_path, gee_project = gee_project)
           point_preds[[m]] <- preds$similarity
