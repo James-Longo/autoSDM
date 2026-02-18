@@ -244,11 +244,12 @@ def main():
                 try: ee.Initialize()
                 except: pass
                 
-                sys.stderr.write("Running 5-fold Spatial Block Cross-Validation (Centroid)...\n")
+                sys.stderr.write("Running 10-fold Spatial Block Cross-Validation (Centroid + Ridge evaluation)...\n")
                 meta["cv_results"] = run_parallel_cv(
                     df=df,
                     ecological_vars=[f"A{i:02d}" for i in range(64)],
-                    scale=args.scale
+                    scale=args.scale,
+                    n_folds=10
                 )
 
         elif args.method == "ridge":
@@ -287,8 +288,23 @@ def main():
                 "method": "ridge",
                 "weights": res['weights'],
                 "intercept": res['intercept'],
-                "metrics": res['metrics']
+                "metrics": res['metrics'],
+                "cv_results": None
             }
+
+            if args.cv:
+                from autoSDM.trainer import run_parallel_cv
+                import ee
+                try: ee.Initialize()
+                except: pass
+                
+                sys.stderr.write("Running 10-fold Spatial Block Cross-Validation (Centroid + Ridge evaluation)...\n")
+                meta["cv_results"] = run_parallel_cv(
+                    df=df,
+                    ecological_vars=[f"A{i:02d}" for i in range(64)],
+                    scale=args.scale,
+                    n_folds=10
+                )
         elif args.method == "mean":
             from autoSDM.analyzer import analyze_mean
             res = analyze_mean(df)

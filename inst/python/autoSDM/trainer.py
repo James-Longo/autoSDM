@@ -6,10 +6,10 @@ import os
 import json
 from autoSDM.analyzer import calculate_classifier_metrics
 
-def assign_spatial_folds(df, n_folds=5, grid_size=None):
+def assign_spatial_folds(df, n_folds=10, grid_size=None):
     """
     Assigns fold IDs based on spatial grid blocks.
-    If grid_size is None, it is calculated dynamically to ensure ~25 blocks.
+    If grid_size is None, it is calculated dynamically to ensure ~100 blocks.
     """
     df = df.copy()
     
@@ -21,10 +21,10 @@ def assign_spatial_folds(df, n_folds=5, grid_size=None):
         lat_range = lat_max - lat_min
         lon_range = lon_max - lon_min
         
-        # Target roughly 5x5 = 25 blocks to allow for sufficient variation
+        # Target roughly 10x10 = 100 blocks to allow for sufficient variation in 10 folds
         # We take the larger dimension to drive the scale
         max_dim = max(lat_range, lon_range)
-        grid_size = max_dim / 5.0
+        grid_size = max_dim / 10.0
         
         # Ensure a minimum practical size (e.g. 100m ~ 0.001 deg) to avoid numerical issues
         grid_size = max(grid_size, 0.001)
@@ -271,35 +271,45 @@ def run_cv_fold(fold_idx, df, ecological_vars, class_property, scale):
     test_df = df[df['fold'] == fold_idx]
     if test_df.empty: return None
 
-    # Centroid
-    from autoSDM.analyzer import analyze_embeddings
+    from autoSDM.analyzer import analyze_embeddings, analyze_ridge
+    
+    # 1. Centroid
     c_res = analyze_embeddings(train_df, class_property=class_property)
-    # Correctly handle multi-centroids in CV
     t_emb = test_df[[f"A{i:02d}" for i in range(64)]].values
     c_sim_matrix = np.dot(t_emb, np.array(c_res['centroids']).T)
     c_sims = np.max(c_sim_matrix, axis=1)
     c_metrics = calculate_classifier_metrics(c_sims[test_df[class_property] == 1], c_sims[test_df[class_property] == 0])
     
-    return {'centroid': c_metrics}
+    # 2. Ridge
+    r_res = analyze_ridge(train_df, class_property=class_property)
+    r_weights = np.array(r_res['weights'])
+    r_intercept = r_res['intercept']
+    r_sims = np.dot(t_emb, r_weights) + r_intercept
+    r_metrics = calculate_classifier_metrics(r_sims[test_df[class_property] == 1], r_sims[test_df[class_property] == 0])
+    
+    return {'centroid': c_metrics, 'ridge': r_metrics}
 
-def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, n_folds=5):
+def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, n_folds=10):
     df_f = assign_spatial_folds(df, n_folds=n_folds)
     
     # Sequential execution is now much more stable for GEE and fast enough
     # since we avoid re-sampling imagery if embeddings are already present.
     res = []
     for i in range(n_folds):
-        sys.stderr.write(f"Processing 5-fold CV: Fold {i+1}/{n_folds}...\n")
+        sys.stderr.write(f"Processing 10-fold CV: Fold {i+1}/{n_folds}...\n")
         fold_res = run_cv_fold(i, df_f, ecological_vars, class_property, scale)
         if fold_res:
             res.append(fold_res)
     
     if not res:
         sys.stderr.write("Warning: All CV folds failed or returned no data.\n")
-        return {'centroid': {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0}}
+        return {
+            'centroid': {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0},
+            'ridge': {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0}
+        }
     
     avg = {}
-    for m in ['centroid']:
+    for m in ['centroid', 'ridge']:
         avg[m] = {met: float(np.mean([r[m][met] for r in res])) for met in ['cbi', 'auc_roc', 'auc_pr']}
     return avg
 
