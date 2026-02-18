@@ -13,9 +13,38 @@
 #' @param cv Optional. Boolean whether to run 5-fold Spatial Block Cross-Validation. Defaults to FALSE.
 #' @param predict_coords Optional. Data frame of coordinates to predict at.
 #' @param year Optional. Alpha Earth Mosaic year for mapping. Defaults to 2025.
+#' @param count Optional. Number of background points to generate. Defaults to 10x presence points (analyze) or 1000 (background).
 #' @return A list containing training data, models, and prediction results.
 #' @export
-autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_path = NULL, gee_project = NULL, cv = FALSE, predict_coords = NULL, methods = NULL, year = 2025) {
+autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_path = NULL, gee_project = NULL, cv = FALSE, predict_coords = NULL, methods = NULL, year = 2025, count = NULL) {
+  # 1. Input Validation
+  if (missing(data)) stop("Argument 'data' is required.")
+  
+  # Default AOI if not provided: Bounding box of data + buffer
+  if (is.null(aoi) && is.null(predict_coords)) {
+      message("No AOI provided. Calculating default bounding box from input data...")
+      coords <- if (inherits(data, "sf")) sf::st_coordinates(data) else data[, c("longitude", "latitude")]
+      
+      min_lon <- min(coords[,1], na.rm=TRUE)
+      max_lon <- max(coords[,1], na.rm=TRUE)
+      min_lat <- min(coords[,2], na.rm=TRUE)
+      max_lat <- max(coords[,2], na.rm=TRUE)
+      
+      lon_range <- max_lon - min_lon
+      lat_range <- max_lat - min_lat
+      buffer <- 0 
+      
+      # Center and radius approximation for CLI
+      center_lon <- (min_lon + max_lon) / 2
+      center_lat <- (min_lat + max_lat) / 2
+      # Radius in meters approx (1 deg ~ 111km)
+      # We use the larger dimension to cover the rectangle with a circle
+      radius_m <- max(lon_range, lat_range) / 2 * 111000
+      
+      aoi <- list(lat = center_lat, lon = center_lon, radius = radius_m)
+      message(sprintf("  Default AOI: %0.1f km radius around %0.4f, %0.4f", radius_m/1000, center_lat, center_lon))
+  }
+
   # Validate: need at least aoi or predict_coords
   if (is.null(aoi) && is.null(predict_coords)) {
     stop("You must provide either 'aoi' (for map generation) or 'predict_coords' (for point predictions), or both.")
@@ -131,7 +160,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
       system2(python_path, args = c(
         "-m", "autoSDM.cli", "background",
         "--output", shQuote(bg_csv),
-        "--count", n_bg,
+        "--count", if (!is.null(count)) count else n_bg,
         "--scale", scale,
         "--year", year,
         proj_arg, aoi_arg
@@ -172,6 +201,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
         "--method", py_method, 
         "--scale", scale, 
         "--year", year, 
+        if (!is.null(count)) c("--count", count) else NULL,
         cv_arg, proj_arg, aoi_arg
       ))
       
@@ -207,10 +237,29 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
       for (m in methods) {
         meta_p <- file.path(output_dir, paste0(m, ".json"))
         if (file.exists(meta_p)) {
+          # Read metadata to get normalization range
+          m_meta <- jsonlite::fromJSON(meta_p)
+          s_range <- m_meta$similarity_range
+          
           preds <- predict_at_coords(pred_embedded, analysis_meta_path = meta_p, scale = scale, python_path = python_path, gee_project = gee_project)
-          point_preds[[m]] <- preds$similarity
-          point_preds$similarity <- point_preds$similarity * preds$similarity
+          
+          # Normalize to 0-1
+          if (!is.null(s_range) && (s_range[2] - s_range[1] > 1e-9)) {
+              norm_sim <- (preds$similarity - s_range[1]) / (s_range[2] - s_range[1])
+          } else {
+              norm_sim <- preds$similarity
+          }
+          
+          point_preds[[m]] <- norm_sim
+          point_preds$similarity <- point_preds$similarity * norm_sim
         }
+      }
+
+      # Final normalization of the ensemble product to 0-1
+      e_min <- min(point_preds$similarity, na.rm = TRUE)
+      e_max <- max(point_preds$similarity, na.rm = TRUE)
+      if (e_max - e_min > 1e-9) {
+          point_preds$similarity <- (point_preds$similarity - e_min) / (e_max - e_min)
       }
     }
 

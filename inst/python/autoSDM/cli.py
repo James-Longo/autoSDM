@@ -161,7 +161,7 @@ def main():
     parser.add_argument("--lon", type=float, help="Longitude for AOI center")
     parser.add_argument("--radius", type=float, help="Radius (in meters) for AOI")
     parser.add_argument("--species-col", help="Column name for species in multi-species mode.")
-    parser.add_argument("--count", type=int, default=1000, help="Number of background points to sample.")
+    parser.add_argument("--count", type=int, default=None, help="Number of background points to sample.")
     parser.add_argument("--cv", action="store_true", help="Run spatial block cross-validation.")
     parser.add_argument("--year", type=int, default=2025, help="Alpha Earth Mosaic year for mapping (default: 2025)")
     
@@ -201,8 +201,9 @@ def main():
             sys.exit(1)
 
         from autoSDM.trainer import get_background_embeddings
-        sys.stderr.write(f"Sampling {args.count} background points from GEE...\n")
-        df_bg = get_background_embeddings(aoi, n_points=args.count, scale=args.scale, year=args.year)
+        n_bg = args.count if args.count else 1000
+        sys.stderr.write(f"Sampling {n_bg} background points from GEE...\n")
+        df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=args.year)
         
         os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
         df_bg.to_csv(args.output, index=False)
@@ -245,8 +246,8 @@ def main():
                 
                 if aoi:
                     from autoSDM.trainer import get_background_embeddings
-                    n_bg = len(df) * 10
-                    sys.stderr.write(f"Presence-only data detected for Centroid. Generating {n_bg} background points for evaluation (10:1 ratio)...\n")
+                    n_bg = args.count if args.count else len(df) * 10
+                    sys.stderr.write(f"Presence-only data detected for Centroid. Generating {n_bg} background points for evaluation (Override: {bool(args.count)})...\n")
                     df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=args.year)
                     if not df_bg.empty:
                         df = pd.concat([df, df_bg], ignore_index=True)
@@ -264,7 +265,9 @@ def main():
                 "method": "centroid",
                 "centroids": res['centroids'],
                 "metrics": res['metrics'],
-                "cv_results": None
+                "cv_results": None,
+                "similarity_range": res.get('similarity_range'),
+                "similarities": res.get('similarities')
             }
             
             if args.cv:
@@ -274,12 +277,31 @@ def main():
                 except: pass
                 
                 sys.stderr.write("Running 10-fold Spatial Block Cross-Validation (Centroid + Ridge evaluation)...\n")
-                meta["cv_results"] = run_parallel_cv(
+                cv_res = run_parallel_cv(
                     df=df,
                     ecological_vars=[f"A{i:02d}" for i in range(64)],
                     scale=args.scale,
                     n_folds=10
                 )
+                
+                # Extract Ensemble metrics to separate file
+                if 'ensemble' in cv_res:
+                    ensemble_metrics = cv_res.pop('ensemble')
+                    base_dir = os.path.dirname(args.output) if os.path.dirname(args.output) else "."
+                    ensemble_path = os.path.join(base_dir, "ensemble.json")
+                    
+                    # Create a proper structure for ensemble.json
+                    ensemble_meta = {
+                        "method": "ensemble",
+                        "metrics": ensemble_metrics, 
+                        "cv_results": {"ensemble": ensemble_metrics} 
+                    }
+                    
+                    with open(ensemble_path, 'w') as f:
+                        json.dump(ensemble_meta, f)
+                    sys.stderr.write(f"Ensemble metrics saved to {ensemble_path}\n")
+                
+                meta["cv_results"] = cv_res
 
         elif args.method == "ridge":
             from autoSDM.analyzer import analyze_ridge
@@ -303,8 +325,8 @@ def main():
                     aoi = ee.Geometry.Rectangle([min_lon - 0.1, min_lat - 0.1, max_lon + 0.1, max_lat + 0.1])
                 
                 from autoSDM.trainer import get_background_embeddings
-                n_bg = len(df) * 10
-                sys.stderr.write(f"Presence-only data detected for Ridge. Generating {n_bg} background points on GEE (10:1 ratio)...\n")
+                n_bg = args.count if args.count else len(df) * 10
+                sys.stderr.write(f"Presence-only data detected for Ridge. Generating {n_bg} background points on GEE (Override: {bool(args.count)})...\n")
                 df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=args.year)
                 if not df_bg.empty:
                     df = pd.concat([df, df_bg], ignore_index=True)
@@ -318,7 +340,9 @@ def main():
                 "weights": res['weights'],
                 "intercept": res['intercept'],
                 "metrics": res['metrics'],
-                "cv_results": None
+                "cv_results": None,
+                "similarity_range": res.get('similarity_range'),
+                "similarities": res.get('similarities')
             }
 
             if args.cv:
@@ -328,12 +352,31 @@ def main():
                 except: pass
                 
                 sys.stderr.write("Running 10-fold Spatial Block Cross-Validation (Centroid + Ridge evaluation)...\n")
-                meta["cv_results"] = run_parallel_cv(
+                cv_res = run_parallel_cv(
                     df=df,
                     ecological_vars=[f"A{i:02d}" for i in range(64)],
                     scale=args.scale,
                     n_folds=10
                 )
+                
+                # Extract Ensemble metrics to separate file
+                if 'ensemble' in cv_res:
+                    ensemble_metrics = cv_res.pop('ensemble')
+                    base_dir = os.path.dirname(args.output) if os.path.dirname(args.output) else "."
+                    ensemble_path = os.path.join(base_dir, "ensemble.json")
+                    
+                    # Create a proper structure for ensemble.json
+                    ensemble_meta = {
+                        "method": "ensemble",
+                        "metrics": ensemble_metrics, 
+                        "cv_results": {"ensemble": ensemble_metrics} 
+                    }
+                    
+                    with open(ensemble_path, 'w') as f:
+                        json.dump(ensemble_meta, f)
+                    sys.stderr.write(f"Ensemble metrics saved to {ensemble_path}\n")
+                
+                meta["cv_results"] = cv_res
         elif args.method == "mean":
             from autoSDM.analyzer import analyze_mean
             res = analyze_mean(df)
@@ -484,24 +527,52 @@ def main():
                 img_i, aoi_i = get_prediction_image(mdata, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year)
                 if aoi is None: aoi = aoi_i
                 
-                # Debug: check if image is potentially all 1s or something
-                sys.stderr.write(f"  Similarity band info: {img_i.select('similarity').bandNames().getInfo()}\n")
+                # Normalize based on similarity_range from training metadata
+                s_range = mdata.get('similarity_range', [0.0, 1.0])
+                # Debugging: ensures we know why a default might be used
+                if 'similarity_range' not in mdata:
+                    sys.stderr.write(f"  Warning: 'similarity_range' missing in {mp}, using default [0, 1]\n")
                 
-                if prediction_map is None:
-                    prediction_map = img_i.select('similarity')
+                # Check for null or invalid range
+                if s_range is None or len(s_range) < 2:
+                    sys.stderr.write(f"  Warning: 'similarity_range' is invalid in {mp}, using default [0, 1]\n")
+                    s_range = [0.0, 1.0]
+
+                s_min, s_max = s_range[0], s_range[1]
+                
+                # Rescale band to 0-1
+                if s_max - s_min > 1e-9:
+                    sys.stderr.write(f"  Normalizing layer to [0, 1] using range: {s_min:.4f} to {s_max:.4f}\n")
+                    norm_img = img_i.select('similarity').subtract(s_min).divide(s_max - s_min)
                 else:
-                    prediction_map = prediction_map.multiply(img_i.select('similarity'))
-                    sys.stderr.write(f"  After multiplying by {mp}, bands: {prediction_map.bandNames().getInfo()}\n")
+                    sys.stderr.write(f"  Skipping normalization (zero range or default): {s_min:.4f} to {s_max:.4f}\n")
+                    norm_img = img_i.select('similarity')
+
+                if prediction_map is None:
+                    prediction_map = norm_img
+                else:
+                    prediction_map = prediction_map.multiply(norm_img)
+                    sys.stderr.write(f"  After multiplying (normalized) {mp}, bands: {prediction_map.bandNames().getInfo()}\n")
             
             prediction_map = prediction_map.rename('similarity')
+
             thresholds = {}
         else:
-            # Standard Extrapolate Mode
+            # Standard Extrapolate Mode (Single method)
             with open(args.meta) as f:
                 meta = json.load(f)
             
-            prediction_map, aoi = get_prediction_image(meta, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year)
+            prediction_map_raw, aoi = get_prediction_image(meta, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year)
             
+            # Normalize single map if range exists
+            s_range = meta.get('similarity_range', [0.0, 1.0])
+            s_min, s_max = s_range[0], s_range[1]
+            if s_max - s_min > 1e-9:
+                sys.stderr.write(f"  Normalizing (single) layer to [0, 1] using range: {s_min:.4f} to {s_max:.4f}\n")
+                prediction_map = prediction_map_raw.select('similarity').subtract(s_min).divide(s_max - s_min).rename('similarity')
+            else:
+                prediction_map = prediction_map_raw
+
             thresholds = {}
         
         # Define output path base

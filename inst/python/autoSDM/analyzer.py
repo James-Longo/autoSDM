@@ -190,7 +190,8 @@ def analyze_embeddings(df, class_property='present'):
         "centroids": [centroid.tolist() if hasattr(centroid, 'tolist') else centroid],
         "similarities": similarities.tolist() if hasattr(similarities, 'tolist') else similarities,
         "clean_data": df_clean,
-        "metrics": {}
+        "metrics": {},
+        "similarity_range": [float(np.min(similarities)), float(np.max(similarities))]
     }
     
     if class_property in df_clean.columns:
@@ -227,9 +228,10 @@ def analyze_ridge(df, class_property='present'):
     res_meta = {
         "weights": model.coef_.tolist(),
         "intercept": float(model.intercept_),
-        "similarities": similarities,
+        "similarities": similarities.tolist() if hasattr(similarities, 'tolist') else similarities,
         "clean_data": df_clean,
-        "metrics": {}
+        "metrics": {},
+        "similarity_range": [float(np.min(similarities)), float(np.max(similarities))]
     }
     
     pos_scores = df_clean[df_clean[class_property] == 1]['similarity'].values
@@ -237,7 +239,7 @@ def analyze_ridge(df, class_property='present'):
     res_meta['metrics'] = calculate_classifier_metrics(pos_scores, neg_scores)
     
     return res_meta
-    return res_meta
+
     
 def analyze_mean(df, class_property='present'):
     """
@@ -258,9 +260,10 @@ def analyze_mean(df, class_property='present'):
     
     res_meta = {
         "centroid": mean_vec.tolist(),
-        "similarities": similarities,
+        "similarities": similarities.tolist() if hasattr(similarities, 'tolist') else similarities,
         "clean_data": df_clean,
-        "metrics": {}
+        "metrics": {},
+        "similarity_range": [float(np.min(similarities)), float(np.max(similarities))]
     }
     
     pos_scores = df_clean[df_clean[class_property] == 1]['similarity'].values

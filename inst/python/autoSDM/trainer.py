@@ -287,7 +287,19 @@ def run_cv_fold(fold_idx, df, ecological_vars, class_property, scale):
     r_sims = np.dot(t_emb, r_weights) + r_intercept
     r_metrics = calculate_classifier_metrics(r_sims[test_df[class_property] == 1], r_sims[test_df[class_property] == 0])
     
-    return {'centroid': c_metrics, 'ridge': r_metrics}
+    # 3. Ensemble (Normalized Centroid * Normalized Ridge)
+    # We normalize both to 0-1 based on the min/max of the test set scores
+    # This prevents one method from dominating the product due to score scale.
+    def normalize(vals):
+        v_min, v_max = np.min(vals), np.max(vals)
+        if v_max - v_min == 0: return np.zeros_like(vals)
+        return (vals - v_min) / (v_max - v_min)
+        
+    e_sims = normalize(c_sims) * normalize(r_sims)
+    e_sims = normalize(e_sims) # Final normalization of the ensemble product
+    e_metrics = calculate_classifier_metrics(e_sims[test_df[class_property] == 1], e_sims[test_df[class_property] == 0])
+
+    return {'centroid': c_metrics, 'ridge': r_metrics, 'ensemble': e_metrics}
 
 def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, n_folds=10):
     df_f = assign_spatial_folds(df, n_folds=n_folds)
@@ -305,65 +317,98 @@ def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, n_f
         sys.stderr.write("Warning: All CV folds failed or returned no data.\n")
         return {
             'centroid': {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0},
-            'ridge': {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0}
+            'ridge': {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0},
+            'ensemble': {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0}
         }
     
     avg = {}
-    for m in ['centroid', 'ridge']:
+    for m in ['centroid', 'ridge', 'ensemble']:
         avg[m] = {met: float(np.mean([r[m][met] for r in res])) for met in ['cbi', 'auc_roc', 'auc_pr']}
     return avg
 
 def get_background_embeddings(aoi, n_points=1000, scale=100, year=2025):
     """
     Samples random background points in GEE and extracts their Alpha Earth embeddings.
+    Uses image.sample() to ensure points fall on valid data pixels ("intrinsic mask").
     """
     import ee
     import pandas as pd
-    import json # Added import for json
+    import json
     sys.stderr.write(f"Sampling {n_points} background points from GEE (Year: {year})...\n")
     
-    # Generate excessive random points within AOI to account for water/missing data
-    # We oversample by 5x (down from 20x to avoid memory issues) and then filter+limit 
-    # to get exactly n_points on land
-    oversample_factor = 5
-    bg_points_pool = ee.FeatureCollection.randomPoints(aoi, n_points * oversample_factor)
-    
-    # Extract embeddings
-    asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
-    year_img = ee.ImageCollection(asset_path).filter(ee.Filter.calendarRange(int(year), int(year), 'year')).mosaic()
     emb_cols = [f"A{i:02d}" for i in range(64)]
     
-    # Sample embeddings and filter to keep only points on land (where A00 exists)
-    sampled = year_img.sampleRegions(
-        collection=bg_points_pool,
-        scale=scale,
-        geometries=True
-    ).filter(ee.Filter.notNull(['A00'])).limit(n_points)
+    collected_rows = []
+    max_attempts = 10
     
-    # Download to local 
-    # Using more robust .getInfo() on features
-    try:
-        res = sampled.getInfo()
-    except Exception as e:
-        sys.stderr.write(f"Error during GEE background sampling: {e}\n")
-        return pd.DataFrame()
-
-    if not res['features']:
-        sys.stderr.write("Warning: GEE background sampling returned no points.\n")
-        return pd.DataFrame()
+    # Pre-define embedding image ONCE
+    # We must use the mosaic to get data, but sampling at points is faster than scanning the image.
+    asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
+    year_img = ee.ImageCollection(asset_path).filter(ee.Filter.calendarRange(int(year), int(year), 'year')).mosaic()
+    
+    for attempt in range(max_attempts):
+        needed = n_points - len(collected_rows)
+        if needed <= 0:
+            break
+            
+        # Generate random points geometrically (FAST)
+        # We request the full n_points batch to maximize yield in each iteration
+        request_n = n_points
+        sys.stderr.write(f"  Attempt {attempt+1}: Generating {request_n} random points (Need {needed})...\n")
         
-    data = []
-    for f in res['features']:
-        row = f['properties']
-        geom = f['geometry']
-        if geom and 'coordinates' in geom:
-            row['longitude'] = geom['coordinates'][0]
-            row['latitude'] = geom['coordinates'][1]
-            row['year'] = int(year) # Add year to each row
-            row['present'] = 0 # Add present=0 to each row
-            data.append(row)
+        random_pts = ee.FeatureCollection.randomPoints(aoi, request_n)
+        
+        # Extract embeddings at these points
+        # sampleRegions is efficient because it only computes pixels at the points
+        try:
+            samples = year_img.sampleRegions(
+                collection=random_pts,
+                properties=[], # We don't need properties from the random points
+                scale=scale,
+                geometries=True
+            )
+            res = samples.getInfo()
+        except Exception as e:
+            sys.stderr.write(f"  Error in sampling attempt {attempt+1}: {e}\n")
+            continue
+            
+        if not res['features']:
+            sys.stderr.write(f"  Warning: Attempt {attempt+1} yielded no valid data points (all masked?).\n")
+            continue
+            
+        # Parse features
+        valid_count = 0
+        for feat in res['features']:
+            props = feat['properties']
+            geom = feat['geometry']['coordinates']
+            
+            # Check if we have valid embeddings (A00 should exist)
+            if 'A00' not in props: 
+                continue
+                
+            row = {
+                'longitude': geom[0],
+                'latitude': geom[1],
+                'present': 0
+            }
+            # Add embeddings
+            for col in emb_cols:
+                row[col] = props.get(col, 0.0)
+                
+            collected_rows.append(row)
+            valid_count += 1
+            
+        sys.stderr.write(f"  Got {valid_count} valid points. Total: {len(collected_rows)}/{n_points}\n")
+            
+    df_bg = pd.DataFrame(collected_rows)
     
-    df_bg = pd.DataFrame(data)
-    sys.stderr.write(f"Background sampling complete. Collected {len(df_bg)} points on land.\n")
+    # Shuffle and limit to exactly n_points
+    if len(df_bg) > n_points:
+        df_bg = df_bg.sample(n=n_points, random_state=42).reset_index(drop=True)
+    elif len(df_bg) < n_points:
+        sys.stderr.write(f"Warning: Could not collect enough background points after {max_attempts} attempts. Found {len(df_bg)}/{n_points}.\n")
+        
+    sys.stderr.write(f"Background sampling complete. Final count: {len(df_bg)}\n")
+    
     return df_bg
 
