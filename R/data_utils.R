@@ -2,17 +2,16 @@
 #'
 #' This function standardizes input data frames for use in the autoSDM pipeline.
 #' It renames coordinate/year/presence columns to standard lowercase names,
-#' optionally keeps nuisance variables, and removes all other columns.
+#' preserves Alpha Earth embeddings if present, and removes all other columns.
 #'
 #' @param data A data frame containing your survey data.
 #' @param coords A character vector of length 2 specifying the longitude and latitude columns IN ORDER: c(longitude_col, latitude_col). Note: Longitude first, then Latitude!
 #' @param year A character string specifying the year or date column.
 #' @param presence Optional. A character string specifying the presence/absence column (values should be 0 or 1).
 #' @param species Optional. A character string specifying the species name column.
-#' @param nuisance_vars Optional. A character vector of column names to keep as nuisance variables (e.g., c("elevation", "aspect")).
 #' @return A standardized data frame ready for `autoSDM()` with lowercase column names.
 #' @export
-format_data <- function(data, coords, year, presence = NULL, species = NULL, nuisance_vars = NULL) {
+format_data <- function(data, coords, year, presence = NULL, species = NULL) {
     if (!is.data.frame(data)) {
         stop("Input 'data' must be a data frame.")
     }
@@ -40,14 +39,6 @@ format_data <- function(data, coords, year, presence = NULL, species = NULL, nui
     # 4. Species Validation
     if (!is.null(species) && !species %in% names(data)) {
         stop(paste("Species column not found:", species))
-    }
-
-    # 5. Nuisance Variables Validation
-    if (!is.null(nuisance_vars)) {
-        missing_nuisance <- setdiff(nuisance_vars, names(data))
-        if (length(missing_nuisance) > 0) {
-            stop(paste("Nuisance columns not found in data:", paste(missing_nuisance, collapse = ", ")))
-        }
     }
 
     # 5. Build the output data frame with only required columns
@@ -116,15 +107,6 @@ format_data <- function(data, coords, year, presence = NULL, species = NULL, nui
     # 9. Add species column (lowercase "species")
     if (!is.null(species)) {
         result$species <- as.character(data[[species]])
-    }
-
-    # 10. Add nuisance variables (lowercase names)
-    if (!is.null(nuisance_vars)) {
-        for (nv in nuisance_vars) {
-            # Create lowercase column name
-            col_name <- tolower(gsub("[^a-zA-Z0-9]", "_", nv))
-            result[[col_name]] <- data[[nv]]
-        }
     }
 
     # 11. Preserve Alpha Earth Embeddings (A00-A63) if they exist

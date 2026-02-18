@@ -1,25 +1,7 @@
 import numpy as np
 import pandas as pd
 
-def geometric_median(X, eps=1e-5, max_iter=100):
-    """
-    Calculates the Geometric Median of a set of points X.
-    Weiszfeld's algorithm is an iterative step to find the point minimizing 
-    the sum of Euclidean distances.
-    """
-    y = np.mean(X, axis=0) # Initial guess: arithmetic mean
-    for _ in range(max_iter):
-        dist = np.linalg.norm(X - y, axis=1)
-        # Avoid division by zero
-        dist = np.maximum(dist, 1e-10)
-        
-        weights = 1.0 / dist
-        new_y = np.sum(X * weights[:, np.newaxis], axis=0) / np.sum(weights)
-        
-        if np.linalg.norm(new_y - y) < eps:
-            return new_y
-        y = new_y
-    return y
+
 
 def calculate_cbi(pos_scores, all_scores, window_width=0.1, n_bins=100):
     """
@@ -92,7 +74,10 @@ def calculate_classifier_metrics(scores_pos, scores_neg):
             'auc_roc': 0.5,
             'auc_pr': 0.0,
             'tss': 0.0,
-            'ba': 0.5
+            'ba': 0.5,
+            'threshold_5pct': float(np.percentile(scores_pos, 5)) if n_pos > 0 else 0.0,
+            'threshold_10pct': float(np.percentile(scores_pos, 10)) if n_pos > 0 else 0.0,
+            'point_biserial': 0.0
         }
 
     # 1. AUC-ROC (Mann-Whitney U method - Rank based)
@@ -128,21 +113,32 @@ def calculate_classifier_metrics(scores_pos, scores_neg):
     tss = np.max(combined - 1)
     ba = np.max(combined / 2)
 
+    # 4. Suitability Thresholds (Omission rates)
+    # threshold_5pct: Suitability value above which 95% of presences lie
+    threshold_5pct = np.percentile(scores_pos, 5)
+    threshold_10pct = np.percentile(scores_pos, 10)
+
+    # 5. Point-Biserial Correlation (alternative to AUC for PO data)
+    from scipy.stats import pointbiserialr
+    # Correlation between binary labels (Presence=1, Absence=0) and continuous scores
+    pb_corr, _ = pointbiserialr(np.concatenate([np.ones(n_pos), np.zeros(n_neg)]), scores_all)
+
     return {
         'cbi': float(cbi),
         'auc_roc': float(auc_roc),
         'auc_pr': float(auc_pr),
         'tss': float(tss),
-        'ba': float(ba)
+        'ba': float(ba),
+        'threshold_5pct': float(threshold_5pct),
+        'threshold_10pct': float(threshold_10pct),
+        'point_biserial': float(pb_corr) if not np.isnan(pb_corr) else 0.0
     }
 
-def analyze_embeddings(df, class_property='present', forced_k=None):
+def analyze_embeddings(df, class_property='present'):
     """
-    Analyzes embeddings: detects one or more habitat centroids via picky K-Means,
-    calculates max-similarity, and validation metrics (CBI, AUC).
-    If forced_k is provided, it skips picky detection and returns exactly k clusters.
+    Analyzes embeddings: calculates the environmental centroid (arithmetic mean)
+    of presence points and computes validation metrics (CBI, AUC).
     """
-    from scipy.cluster.vq import kmeans2
     import sys
 
     emb_cols = [f"A{i:02d}" for i in range(64)]
@@ -182,83 +178,21 @@ def analyze_embeddings(df, class_property='present', forced_k=None):
         
     embs = presence_df[emb_cols].values
     
-    # --- Centroid Detection ---
-    best_centroids = []
-    
-    if forced_k is not None:
-        sys.stderr.write(f"Local Multi-Centroid: FORCING k={forced_k}\n")
-        if forced_k == 1:
-            best_centroids = [geometric_median(embs)]
-        else:
-            try:
-                centers, labels = kmeans2(embs, k=forced_k, minit='points', iter=20, missing='warn')
-                for i in range(forced_k):
-                    pts = embs[labels == i]
-                    if len(pts) > 0:
-                        best_centroids.append(geometric_median(pts))
-                    else:
-                        best_centroids.append(geometric_median(embs))
-            except Exception as e:
-                sys.stderr.write(f"Warning: Local Forced k={forced_k} failed: {e}. Falling back to k=1.\n")
-                best_centroids = [geometric_median(embs)]
-    else:
-        # Picky Multi-Centroid Detection
-        # Base: k=1
-        c1 = geometric_median(embs)
-        wss1 = np.sum(np.linalg.norm(embs - c1, axis=1)**2)
-        best_centroids = [c1]
-        
-        # Try k=2
-        if len(embs) > 50:
-            try:
-                c2_centers, c2_labels = kmeans2(embs, k=2, minit='points', iter=20, missing='warn')
-                wss2 = 0
-                clusters = []
-                for i in range(2):
-                    cluster_pts = embs[c2_labels == i]
-                    if len(cluster_pts) > 0:
-                        c_med = geometric_median(cluster_pts)
-                        wss2 += np.sum(np.linalg.norm(cluster_pts - c_med, axis=1)**2)
-                        clusters.append({'median': c_med, 'count': len(cluster_pts)})
-                
-                if len(clusters) == 2:
-                    mass_ok = all(c['count'] / len(embs) >= 0.15 for c in clusters)
-                    dist = np.linalg.norm(clusters[0]['median'] - clusters[1]['median'])
-                    if wss2 < 0.75 * wss1 and mass_ok and dist > 0.5:
-                        sys.stderr.write(f"Local Multi-Centroid: Detected 2 habitats (WSS red: {wss2/wss1:.2f}, dist: {dist:.2f}).\n")
-                        best_centroids = [c['median'] for c in clusters]
-                        
-                        # Try k=3
-                        c3_centers, c3_labels = kmeans2(embs, k=3, minit='points', iter=20, missing='warn')
-                        wss3 = 0
-                        clusters3 = []
-                        for i in range(3):
-                            cluster_pts = embs[c3_labels == i]
-                            if len(cluster_pts) > 0:
-                                c_med = geometric_median(cluster_pts)
-                                wss3 += np.sum(np.linalg.norm(cluster_pts - c_med, axis=1)**2)
-                                clusters3.append({'median': c_med, 'count': len(cluster_pts)})
-                        
-                        if len(clusters3) == 3:
-                            mass_ok3 = all(c['count'] / len(embs) >= 0.10 for c in clusters3)
-                            dists = [np.linalg.norm(clusters3[i]['median'] - clusters3[j]['median']) for i,j in [(0,1), (1,2), (0,2)]]
-                            if wss3 < 0.80 * wss2 and mass_ok3 and min(dists) > 0.4:
-                                sys.stderr.write(f"Local Multi-Centroid: Detected 3 habitats.\n")
-                                best_centroids = [c['median'] for c in clusters3]
-            except Exception as e:
-                sys.stderr.write(f"Warning: Local Multi-Centroid clustering failed: {e}.\n")
+    # --- Centroid Calculation ---
+    # We strictly use the arithmetic mean (single centroid)
+    centroid = np.mean(embs, axis=0)
 
-    # Max-Similarity for ALL points
-    sim_matrix = np.dot(df_clean[emb_cols].values, np.array(best_centroids).T)
-    similarities = np.max(sim_matrix, axis=1)
+    # Similarity for ALL points (Direct dot product)
+    similarities = np.dot(df_clean[emb_cols].values, centroid)
     df_clean['similarity'] = similarities
     
     res_meta = {
-        "centroids": best_centroids,
-        "similarities": similarities,
+        "centroids": [centroid.tolist() if hasattr(centroid, 'tolist') else centroid],
+        "similarities": similarities.tolist() if hasattr(similarities, 'tolist') else similarities,
         "clean_data": df_clean,
         "metrics": {}
     }
+    
     if class_property in df_clean.columns:
         pos_scores = df_clean[df_clean[class_property] == 1]['similarity'].values
         neg_scores = df_clean[df_clean[class_property] == 0]['similarity'].values

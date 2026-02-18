@@ -12,7 +12,7 @@ import concurrent.futures
 from autoSDM.extractor import GEEExtractor
 from autoSDM.analyzer import analyze_embeddings
 from autoSDM.extrapolate import generate_prediction_map, download_mask, export_to_gcs, merge_rasters
-def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df):
+def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df, year=2025):
     import ee
     try:
         sp_dir = os.path.join(output_dir, str(sp))
@@ -25,45 +25,60 @@ def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df):
             sys.stderr.write(f"--- Warning: No valid points for {sp} after embedding merge ---\n")
             return
 
-        from autoSDM.analyzer import analyze_ridge, analyze_knn
+        from autoSDM.analyzer import analyze_ridge, analyze_embeddings
         from autoSDM.extrapolate import get_prediction_image
         
-        # 1. Ridge
-        res_r = analyze_ridge(df_sp)
-        meta_r = {"method": "ridge", "weights": res_r['weights'], "intercept": res_r['intercept'], "metrics": res_r['metrics']}
-        with open(os.path.join(sp_dir, "ridge.json"), 'w') as f: json.dump(meta_r, f)
+        has_absences = (df_sp['present'] == 0).any() if 'present' in df_sp.columns else False
         
-        # 2. kNN k=1
-        res_k1 = analyze_knn(df_sp, k=1)
-        meta_k1 = {"method": "knn", "train_X": res_k1['train_X'].tolist(), "train_y": res_k1['train_y'].tolist(), "k": 1, "metrics": res_k1['metrics']}
-        with open(os.path.join(sp_dir, "knn1.json"), 'w') as f: json.dump(meta_k1, f)
+        # Determine method to use
+        method_to_use = args.method
+        if method_to_use == "ensemble":
+             method_to_use = "ridge" if has_absences else "centroid"
+
+        if method_to_use == "ridge":
+            if not has_absences:
+                n_bg = len(df_sp) * 10
+                sys.stderr.write(f"Presence-only data for {sp} (Ridge). Generating {n_bg} background points on GEE (10:1 ratio)...\n")
+                from autoSDM.trainer import get_background_embeddings
+                df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=year)
+                if not df_bg.empty:
+                    df_sp = pd.concat([df_sp, df_bg], ignore_index=True)
+            
+            res = analyze_ridge(df_sp)
+            meta = {"method": "ridge", "weights": res['weights'], "intercept": res['intercept'], "metrics": res['metrics']}
+            prefix = f"{sp}_ridge"
+        else:
+            # Default to Centroid for presence-only or if requested
+            if not has_absences and aoi:
+                n_bg = len(df_sp) * 10
+                sys.stderr.write(f"Presence-only data for {sp} (Centroid/Mean). Generating {n_bg} background points for evaluation (10:1 ratio)...\n")
+                from autoSDM.trainer import get_background_embeddings
+                df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=year)
+                if not df_bg.empty:
+                    df_sp = pd.concat([df_sp, df_bg], ignore_index=True)
+
+            res = analyze_embeddings(df_sp)
+            meta = {"method": "centroid", "centroids": res['centroids'], "metrics": res['metrics']}
+            prefix = f"{sp}_centroid"
+
+        with open(os.path.join(sp_dir, f"{meta['method']}.json"), 'w') as f: 
+            json.dump(meta, f)
         
-        # 3. kNN k=3
-        res_k3 = analyze_knn(df_sp, k=3)
-        meta_k3 = {"method": "knn", "train_X": res_k3['train_X'].tolist(), "train_y": res_k3['train_y'].tolist(), "k": 3, "metrics": res_k3['metrics']}
-        with open(os.path.join(sp_dir, "knn3.json"), 'w') as f: json.dump(meta_k3, f)
+        # Prediction Map
+        img, _ = get_prediction_image(meta, aoi=aoi, year=year)
         
-        # Ensemble Prediction Map
-        img_r, _ = get_prediction_image(meta_r, aoi=aoi)
-        img_k1, _ = get_prediction_image(meta_k1, aoi=aoi)
-        img_k3, _ = get_prediction_image(meta_k3, aoi=aoi)
-        
-        ensemble_img = img_r.select('similarity').multiply(img_k1.select('similarity')).multiply(img_k3.select('similarity')).rename('similarity')
-        
-        ensemble_results = {
+        results = {
             "species": sp,
-            "ridge_metrics": res_r['metrics'],
-            "knn1_metrics": res_k1['metrics'],
-            "knn3_metrics": res_k3['metrics']
+            "method": meta['method'],
+            "metrics": res['metrics']
         }
-        with open(os.path.join(sp_dir, "ensemble_results.json"), 'w') as f:
-            json.dump(ensemble_results, f)
+        with open(os.path.join(sp_dir, "results.json"), 'w') as f:
+            json.dump(results, f)
         
         if aoi and not args.view:
             from autoSDM.extrapolate import download_mask
-            prefix = f"{sp}_ensemble"
             sim_path = os.path.join(sp_dir, f"{prefix}_{args.scale}m.tif")
-            download_mask(ensemble_img, aoi, args.scale, sim_path)
+            download_mask(img, aoi, args.scale, sim_path)
 
         sys.stderr.write(f"--- Completed: {sp} ---\n")
     except Exception as e:
@@ -87,7 +102,6 @@ def run_multi_species_pipeline(args, df, output_dir):
     # We extract A00-A63
     master_data = _prepare_training_data(
         unique_coords, 
-        nuisance_vars=[], 
         ecological_vars=[f"A{i:02d}" for i in range(64)], 
         class_property=None, # Not needed for sampling
         scale=args.scale
@@ -120,7 +134,7 @@ def run_multi_species_pipeline(args, df, output_dir):
         futures = []
         for sp in species_list:
             df_sp = df[df[args.species_col] == sp]
-            futures.append(executor.submit(process_species_task, sp, df_sp, output_dir, args, aoi, master_sampled_df))
+            futures.append(executor.submit(process_species_task, sp, df_sp, output_dir, args, aoi, master_sampled_df, args.year))
         
         concurrent.futures.wait(futures)
 
@@ -132,7 +146,7 @@ def main():
     parser.add_argument("--key", help="Optional GEE service account key path. If not provided, uses existing session auth.")
     parser.add_argument("--project", help="Google Cloud Project ID for Earth Engine initialization.")
     parser.add_argument("--aoi-path", help="Path to GeoJSON or Shapefile (polygon) for mapping extent.")
-    parser.add_argument("--meta", nargs='+', help="Path to meta JSON(s) (for extrapolate/ensemble mode)")
+    parser.add_argument("--meta", action="append", help="Path to meta JSON(s) (for extrapolate/ensemble mode)")
     parser.add_argument("--meta2", help="DEPRECATED: Use multiple paths in --meta instead")
     parser.add_argument("--coarse-meta", help="Path to coarse meta JSON (for filtering 10m output)")
     parser.add_argument("--scale", type=int, default=10, help="Scale in meters (default: 10)")
@@ -140,19 +154,17 @@ def main():
     parser.add_argument("--gcs-bucket", help="GCS bucket name for server-side export (bypasses local download)")
     parser.add_argument("--wait", action="store_true", help="Wait for the export task(s) to complete and show progress updates.")
     parser.add_argument("--zip", action="store_true", help="Zip the output rasters (only for local download mode).")
-    parser.add_argument("--method", choices=["centroid", "maxent", "ridge", "knn", "mean", "ensemble"], default="centroid", help="Mapping method.")
-    parser.add_argument("--nuisance-vars", help="Comma-separated list of columns to treat as nuisance variables.")
+    parser.add_argument("--method", choices=["centroid", "ridge", "knn", "mean", "ensemble"], default="centroid", help="Modeling method. Use 'ridge' for presence-absence and 'centroid' for presence-only.")
     parser.add_argument("--prefix", help="Prefix for output raster filenames (default: 'prediction_map')")
     parser.add_argument("--only-similarity", action="store_true", help="Only generate/download similarity map (skip masks)")
     parser.add_argument("--lat", type=float, help="Latitude for AOI center")
     parser.add_argument("--lon", type=float, help="Longitude for AOI center")
     parser.add_argument("--radius", type=float, help="Radius (in meters) for AOI")
     parser.add_argument("--species-col", help="Column name for species in multi-species mode.")
-    parser.add_argument("--k", type=int, help="Force a specific number of clusters for centroid analysis.")
+
     
-    parser.add_argument("--background-method", choices=["sample_extent", "buffer", "none"], help="Method to generate background points if presence-only data is provided.")
-    parser.add_argument("--background-buffer", nargs=2, type=float, help="Min and Max distance (in meters) for buffer-based background sampling. e.g. --background-buffer 100 1000")
     parser.add_argument("--cv", action="store_true", help="Run 5-fold Spatial Block Cross-Validation.")
+    parser.add_argument("--year", type=int, default=2025, help="Alpha Earth Mosaic year for mapping (default: 2025)")
     
     args = parser.parse_args()
     
@@ -162,9 +174,7 @@ def main():
         extractor = GEEExtractor(args.key, project=args.project)
         res = extractor.extract_embeddings(
             df, 
-            scale=args.scale, 
-            background_method=args.background_method,
-            background_buffer=args.background_buffer
+            scale=args.scale
         )
         os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
         res.to_csv(args.output, index=False)
@@ -189,7 +199,32 @@ def main():
 
         if args.method == "centroid":
             from autoSDM.analyzer import analyze_embeddings
-            res = analyze_embeddings(df, forced_k=args.k)
+            has_absences = (df['present'] == 0).any() if 'present' in df.columns else False
+            
+            if not has_absences:
+                sys.stderr.write("Presence-only data detected for Centroid. Attempting background generation for evaluation...\n")
+                # Reconstruct AOI
+                aoi = None
+                if args.lat is not None and args.lon is not None and args.radius is not None:
+                    aoi = ee.Geometry.Point([args.lon, args.lat]).buffer(args.radius)
+                elif args.aoi_path:
+                    import geopandas as gpd
+                    gdf = gpd.read_file(args.aoi_path)
+                    if gdf.crs and gdf.crs.to_epsg() != 4326: gdf = gdf.to_crs(epsg=4326)
+                    bounds = gdf.total_bounds
+                    aoi = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+                
+                if aoi:
+                    from autoSDM.trainer import get_background_embeddings
+                    n_bg = len(df) * 10
+                    sys.stderr.write(f"Presence-only data detected for Centroid. Generating {n_bg} background points for evaluation (10:1 ratio)...\n")
+                    df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=args.year)
+                    if not df_bg.empty:
+                        df = pd.concat([df, df_bg], ignore_index=True)
+                else:
+                    sys.stderr.write("Warning: No AOI provided, skipping background generation for Centroid metrics.\n")
+
+            res = analyze_embeddings(df)
             # Save similarities
             res['clean_data']['similarity'] = res['similarities']
             os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
@@ -198,7 +233,7 @@ def main():
             # Save metadata
             meta = {
                 "method": "centroid",
-                "centroids": [c.tolist() for c in res['centroids']],
+                "centroids": res['centroids'],
                 "metrics": res['metrics'],
                 "cv_results": None
             }
@@ -212,59 +247,38 @@ def main():
                 sys.stderr.write("Running 5-fold Spatial Block Cross-Validation (Centroid)...\n")
                 meta["cv_results"] = run_parallel_cv(
                     df=df,
-                    nuisance_vars=[],
                     ecological_vars=[f"A{i:02d}" for i in range(64)],
                     scale=args.scale
                 )
-        elif args.method == "maxent":
-            # Maxent Mode - requires GEE for cloud training
-            import ee
-            from autoSDM.trainer import train_maxent_model, run_parallel_cv
-            
-            # Initialize GEE if not already done
-            try:
-                ee.Initialize()
-            except Exception:
-                pass 
-            
-            nuisance_vars = args.nuisance_vars.split(',') if args.nuisance_vars else []
-            ecological_vars = [f"A{i:02d}" for i in range(64)]
-            
-            classifier, nuisance_optima, df_clean, metrics = train_maxent_model(
-                df=df,
-                nuisance_vars=nuisance_vars,
-                ecological_vars=ecological_vars,
-                key_path=args.key,
-                scale=args.scale
-            )
-            
-            # Run Parallel CV if requested
-            cv_results = None
-            if args.cv:
-                sys.stderr.write("Running 5-fold Spatial Block Cross-Validation...\n")
-                cv_results = run_parallel_cv(
-                    df=df,
-                    nuisance_vars=nuisance_vars,
-                    ecological_vars=ecological_vars,
-                    scale=args.scale
-                )
-            
-            # Save cleaned data
-            os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-            df_clean.to_csv(args.output, index=False)
-            
-            # Save metadata
-            meta = {
-                "method": args.method,
-                "classifier_serialized": classifier.serialize(),
-                "nuisance_optima": nuisance_optima,
-                "ecological_vars": ecological_vars,
-                "nuisance_vars": nuisance_vars,
-                "metrics": metrics,
-                "cv_results": cv_results
-            }
+
         elif args.method == "ridge":
             from autoSDM.analyzer import analyze_ridge
+            has_absences = (df['present'] == 0).any() if 'present' in df.columns else False
+            if not has_absences:
+                sys.stderr.write("Presence-only data detected for Ridge. Generating background points on GEE...\n")
+                # Reconstruct AOI for background sampling
+                aoi = None
+                if args.lat is not None and args.lon is not None and args.radius is not None:
+                    aoi = ee.Geometry.Point([args.lon, args.lat]).buffer(args.radius)
+                elif args.aoi_path:
+                    import geopandas as gpd
+                    gdf = gpd.read_file(args.aoi_path)
+                    if gdf.crs and gdf.crs.to_epsg() != 4326: gdf = gdf.to_crs(epsg=4326)
+                    bounds = gdf.total_bounds
+                    aoi = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+                else:
+                    # Fallback to bounding box of presences
+                    min_lat, max_lat = df['latitude'].min(), df['latitude'].max()
+                    min_lon, max_lon = df['longitude'].min(), df['longitude'].max()
+                    aoi = ee.Geometry.Rectangle([min_lon - 0.1, min_lat - 0.1, max_lon + 0.1, max_lat + 0.1])
+                
+                from autoSDM.trainer import get_background_embeddings
+                n_bg = len(df) * 10
+                sys.stderr.write(f"Presence-only data detected for Ridge. Generating {n_bg} background points on GEE (10:1 ratio)...\n")
+                df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=args.year)
+                if not df_bg.empty:
+                    df = pd.concat([df, df_bg], ignore_index=True)
+
             res = analyze_ridge(df)
             res['clean_data']['similarity'] = res['similarities']
             os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
@@ -277,7 +291,7 @@ def main():
             }
         elif args.method == "knn":
             from autoSDM.analyzer import analyze_knn
-            res = analyze_knn(df, k=args.k if args.k else 3)
+            res = analyze_knn(df, k=3)
             res['clean_data']['similarity'] = res['similarities']
             os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
             res['clean_data'].to_csv(args.output, index=False)
@@ -363,89 +377,7 @@ def main():
             sim_matrix = np.dot(df_emb[emb_cols].values, np.array(centroids).T)
             df_emb['similarity'] = np.max(sim_matrix, axis=1)
         
-        elif method == "maxent":
-            # Maxent requires GEE classification for the points
-            import ee
-            try: ee.Initialize(project=args.project) if args.project else ee.Initialize()
-            except: pass
-            
-            classifier = ee.deserializer.fromJSON(meta['classifier_serialized'])
-            ecological_vars = meta['ecological_vars']
-            nuisance_vars = meta['nuisance_vars']
-            nuisance_optima = meta['nuisance_optima']
-            
-            # OPTIMIZATION: Use MultiPoint geometries for prediction points too.
-            # This drastically reduces payload size compared to list of Features.
-            
-            # Prediction points usually don't have differing nuisance vals (we use optima).
-            props = {}
-            for v, opt in nuisance_optima.items():
-                props[v] = float(opt)
-                
-            # Extract all coordinates
-            coords = df_emb[['longitude', 'latitude']].values.tolist()
-            
-            # Reduce chunk size to avoid "Computation timed out" with heavy classifier.
-            # 500 points should serve well within the 5-min interactive limit.
-            chunk_size = 500
-            total_scored = 0
-            df_emb['similarity'] = np.nan
-            
-            # Helper to process a slice
-            def process_chunk(sub_df):
-                features = []
-                chunk_indices = []
-                for idx, row in sub_df.iterrows():
-                    p = {v: float(row[v]) for v in ecological_vars if v in row}
-                    p.update(props)
-                    geom = ee.Geometry.Point([row['longitude'], row['latitude']])
-                    features.append(ee.Feature(geom, p).set('orig_index', str(idx)))
-                    chunk_indices.append(idx)
-                
-                fc = ee.FeatureCollection(features)
-                from autoSDM.trainer import get_safe_scores_and_labels
-                return get_safe_scores_and_labels(classifier, fc, 'orig_index', name="Maxent Prediction")
 
-            idx = 0
-            while idx < len(df_emb):
-                current_chunk_size = chunk_size
-                success = False
-                
-                # Dynamic retries with smaller chunks if timeouts occur
-                for attempt in range(3):
-                    end_idx = min(idx + current_chunk_size, len(df_emb))
-                    chunk = df_emb.iloc[idx : end_idx]
-                    
-                    try:
-                        scores, orig_indices = process_chunk(chunk)
-                        
-                        count_in_chunk = 0
-                        for s, idx_str in zip(scores, orig_indices):
-                            if idx_str:
-                                df_emb.at[int(float(idx_str)), 'similarity'] = s
-                                count_in_chunk += 1
-                        
-                        total_scored += count_in_chunk
-                        sys.stderr.write(f"Scored {count_in_chunk} points (idx {idx}-{end_idx}).\n")
-                        idx += current_chunk_size
-                        success = True
-                        break
-                    except Exception as e:
-                        err = str(e)
-                        if "timed out" in err or "time out" in err:
-                            sys.stderr.write(f"Timeout processing chunk {idx}-{end_idx}. Retrying with smaller batch...\n")
-                            current_chunk_size = max(10, current_chunk_size // 4) # drastically reduce
-                        else:
-                            sys.stderr.write(f"Error processing chunk {idx}-{end_idx}: {e}\n")
-                            # If not a timeout (e.g. fatal error), skip this chunk? or retry?
-                            # For robustness, try smaller chunk too.
-                            current_chunk_size = max(10, current_chunk_size // 2)
-                
-                if not success:
-                    sys.stderr.write(f"Failed to process chunk starting at {idx} after retries. Skipping.\n")
-                    idx += chunk_size # Move on to prevent infinite loop
-            
-            sys.stderr.write(f"Maxent prediction: scored {total_scored}/{len(df_emb)} points.\n")
 
         elif method == "ridge":
             weights = np.array(meta['weights'])
@@ -521,25 +453,28 @@ def main():
         
         if args.mode == "ensemble":
             meta_paths = args.meta
-            if args.meta2: # Compatibility
-                meta_paths.append(args.meta2)
-            
             if not meta_paths or len(meta_paths) < 1:
                 sys.stderr.write("Error: At least one --meta file required for ensemble/extrapolate mode.\n")
                 sys.exit(1)
+            sys.stderr.write(f"Ensemble mode: Loading {len(meta_paths)} meta files: {meta_paths}\n")
             
             prediction_map = None
             for i, mp in enumerate(meta_paths):
+                sys.stderr.write(f"Processing meta file {i+1}/{len(meta_paths)}: {mp}\n")
                 with open(mp) as f:
                     mdata = json.load(f)
                 
-                img_i, aoi_i = get_prediction_image(mdata, df, coarse_filter=coarse_filter, aoi=aoi)
+                img_i, aoi_i = get_prediction_image(mdata, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year)
                 if aoi is None: aoi = aoi_i
+                
+                # Debug: check if image is potentially all 1s or something
+                sys.stderr.write(f"  Similarity band info: {img_i.select('similarity').bandNames().getInfo()}\n")
                 
                 if prediction_map is None:
                     prediction_map = img_i.select('similarity')
                 else:
                     prediction_map = prediction_map.multiply(img_i.select('similarity'))
+                    sys.stderr.write(f"  After multiplying by {mp}, bands: {prediction_map.bandNames().getInfo()}\n")
             
             prediction_map = prediction_map.rename('similarity')
             thresholds = {}
@@ -548,7 +483,7 @@ def main():
             with open(args.meta) as f:
                 meta = json.load(f)
             
-            prediction_map, aoi = get_prediction_image(meta, df, coarse_filter=coarse_filter, aoi=aoi)
+            prediction_map, aoi = get_prediction_image(meta, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year)
             
             thresholds = {}
         

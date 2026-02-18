@@ -73,43 +73,32 @@ def merge_rasters(file_list, output_filename):
         for src in src_files:
             src.close()
 
-def generate_prediction_map(centroid, df=None, coarse_filter=None, aoi=None):
+def generate_prediction_map(centroid, df=None, coarse_filter=None, aoi=None, year=2025):
     """
     Returns:
         image: ee.Image with similarity band.
         aoi: ee.Geometry.
     """
     asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
+    emb_cols = [f"A{i:02d}" for i in range(64)]
     
-    # Get the latest Alpha Earth image (2025)
-    yr = 2025
+    # Use specified year (defaults to 2025)
+    sys.stderr.write(f"Using {year} Alpha Earth Mosaic for mapping...\n")
     img = ee.ImageCollection(asset_path)\
-        .filter(ee.Filter.calendarRange(yr, yr, 'year'))\
-        .mosaic()
+        .filter(ee.Filter.calendarRange(year, year, 'year'))\
+        .mosaic()\
+        .select(emb_cols)
         
-    if img is None:
-        raise RuntimeError(f"Could not find AlphaEarth image for year {yr}")
-
     if aoi is None:
         if df is None:
             raise ValueError("Either 'df' or 'aoi' must be provided to determine the mapping extent.")
         # Calculate AOI from survey data
-        min_lat = df['Latitude'].min()
-        max_lat = df['Latitude'].max()
-        min_lon = df['Longitude'].min()
-        max_lon = df['Longitude'].max()
-        
-        # Add a small buffer to the AOI (approx 1km)
-        buffer = 0.01 
-        aoi = ee.Geometry.Rectangle([
-            min_lon - buffer, 
-            min_lat - buffer, 
-            max_lon + buffer, 
-            max_lat + buffer
-        ])
+        min_lat, max_lat = df['latitude'].min(), df['latitude'].max()
+        min_lon, max_lon = df['longitude'].min(), df['longitude'].max()
+        aoi = ee.Geometry.Rectangle([min_lon - 0.01, min_lat - 0.01, max_lon + 0.01, max_lat + 0.01])
     
-    # Create centroid constant image
-    centroid_img = ee.Image.constant(list(centroid))
+    # Create centroid constant image with matching band names for clean multiplication
+    centroid_img = ee.Image.constant(list(centroid)).rename(emb_cols)
     
     # Calculate Dot Product (Cosine Similarity)
     dot_product = img.multiply(centroid_img).reduce(ee.Reducer.sum()).rename('similarity')
@@ -117,95 +106,61 @@ def generate_prediction_map(centroid, df=None, coarse_filter=None, aoi=None):
     # --- Coarse Filtering Logic ---
     if coarse_filter:
         sys.stderr.write("Applying coarse scale (1km) filter...\n")
-        coarse_centroid_img = ee.Image.constant(list(coarse_filter['centroid']))
+        coarse_centroid_img = ee.Image.constant(list(coarse_filter['centroid'])).rename(emb_cols)
         coarse_dot = img.multiply(coarse_centroid_img).reduce(ee.Reducer.sum())
-        
-        # We avoid explicit .reproject(scale=1000) here because it causes 
-        # "Reprojection output too large" errors during large-scale exports.
-        # GEE will handle the sampling automatically.
         coarse_mask = coarse_dot.gte(coarse_filter['threshold'])
-        
         dot_product = dot_product.updateMask(coarse_mask)
 
     return dot_product, aoi
 
-def generate_classifier_prediction_map(classifier, df=None, ecological_vars=None, nuisance_optima=None, coarse_filter=None, aoi=None):
-    """
-    Generates a prediction map for a classifier (e.g., Maxent) at standardized nuisance levels.
-    
-    Args:
-        classifier: Trained ee.Classifier.
-        df: DataFrame for AOI (optional if aoi is provided).
-        ecological_vars: List of ecological (Alpha Earth) band names.
-        nuisance_optima: Dict of {band_name: optimal_value}.
-        coarse_filter: Optional coarse filter dict.
-        aoi: ee.Geometry (optional).
-    
-    Returns:
-        image: ee.Image with probability band.
-        aoi: ee.Geometry.
-    """
-    asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
-    yr = 2025
-    img = ee.ImageCollection(asset_path)\
-        .filter(ee.Filter.calendarRange(yr, yr, 'year'))\
-        .mosaic()
-        
-    if img is None:
-        raise RuntimeError(f"Could not find AlphaEarth image for year {yr}")
 
-    if aoi is None:
-        if df is None:
-            raise ValueError("Either 'df' or 'aoi' must be provided to determine the mapping extent.")
-        # Calculate AOI
-        min_lat, max_lat = df['Latitude'].min(), df['Latitude'].max()
-        min_lon, max_lon = df['Longitude'].min(), df['Longitude'].max()
-        buffer = 0.01 
-        aoi = ee.Geometry.Rectangle([min_lon - buffer, min_lat - buffer, max_lon + buffer, max_lat + buffer])
-    
-    # 1. Start with ecological stack
-    prediction_stack = img.select(ecological_vars)
-    
-    # 2. Add constant nuisance bands
-    for var, val in nuisance_optima.items():
-        constant_img = ee.Image.constant(val).rename(var)
-        prediction_stack = prediction_stack.addBands(constant_img)
-        
-    # 3. Classify and take the first band (which is the probability/classification)
-    standardized_map = prediction_stack.classify(classifier).select(0).rename('similarity')
-    
-    # 4. Apply Coarse Filter if provided
-    if coarse_filter:
-        sys.stderr.write("Applying coarse scale (1km) filter...\n")
-        coarse_centroid_img = ee.Image.constant(list(coarse_filter['centroid']))
-        coarse_dot = img.multiply(coarse_centroid_img).reduce(ee.Reducer.sum())
-        coarse_mask = coarse_dot.gte(coarse_filter['threshold'])
-        standardized_map = standardized_map.updateMask(coarse_mask)
 
-    return standardized_map, aoi
-
-def get_prediction_image(meta, df=None, coarse_filter=None, aoi=None):
+def get_prediction_image(meta, df=None, coarse_filter=None, aoi=None, year=2025):
     """
     Reconstructs an ee.Image prediction from metadata.
     """
     method = meta.get('method', 'centroid')
     if method == "centroid":
         return generate_prediction_map(
+            centroid=meta['centroids'][0] if isinstance(meta['centroids'][0], list) else meta['centroids'],
+            df=df,
+            coarse_filter=coarse_filter,
+            aoi=aoi,
+            year=year
+        )
+    elif method == "mean":
+        return generate_prediction_map(
             centroid=meta['centroid'],
             df=df,
             coarse_filter=coarse_filter,
-            aoi=aoi
+            aoi=aoi,
+            year=year
         )
+    elif method == "ridge":
+        # Linear Predictor: Dot(embs, weights) + intercept
+        weights = meta['weights']
+        intercept = meta['intercept']
+        emb_cols = [f"A{i:02d}" for i in range(64)]
+        
+        asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
+        img = ee.ImageCollection(asset_path)\
+            .filter(ee.Filter.calendarRange(year, year, 'year'))\
+            .mosaic()\
+            .select(emb_cols)
+        
+        weights_img = ee.Image.constant(list(weights)).rename(emb_cols)
+        prediction = img.multiply(weights_img).reduce(ee.Reducer.sum()).add(intercept).rename('similarity')
+        
+        # Determine AOI
+        if aoi is None:
+            if df is None: raise ValueError("df or aoi required")
+            min_lat, max_lat = df['latitude'].min(), df['latitude'].max()
+            min_lon, max_lon = df['longitude'].min(), df['longitude'].max()
+            aoi = ee.Geometry.Rectangle([min_lon - 0.01, min_lat - 0.01, max_lon + 0.01, max_lat + 0.01])
+            
+        return prediction, aoi
     else:
-        classifier = ee.deserializer.fromJSON(meta['classifier_serialized'])
-        return generate_classifier_prediction_map(
-            classifier=classifier,
-            df=df,
-            ecological_vars=meta['ecological_vars'],
-            nuisance_optima=meta['nuisance_optima'],
-            coarse_filter=coarse_filter,
-            aoi=aoi
-        )
+        raise ValueError(f"Method '{method}' does not currently support GEE map generation. Use 'centroid', 'mean', or 'ridge'.")
 
 import math
 
@@ -244,7 +199,7 @@ def download_mask(mask, aoi, scale, filename):
     
     # Check if single tile is sufficient
     if w_px <= CHUNK_SIZE and h_px <= CHUNK_SIZE:
-        success, _, error_msg = _download_single_tile(mask, aoi, scale, filename)
+        success, _, size, error_msg = _download_single_tile(mask, aoi, scale, filename)
         if success:
             return [filename]
         if error_msg:
@@ -296,7 +251,7 @@ def download_mask(mask, aoi, scale, filename):
     failures = []
     
     # Initial status
-    sys.stderr.write(f"Progress: 0 / {total_tile_ha:,.0f} hectares (0%) | Tile 0/{total_tiles} | 0.0 MB\r")
+    sys.stderr.write(f"\rProgress: 0 / {total_tile_ha:,.0f} hectares (0%) | Tile 0/0 | 0.0 MB")
     sys.stderr.flush()
     
     for future in concurrent.futures.as_completed(tasks):
@@ -373,7 +328,7 @@ def export_to_gcs(image, region, scale, bucket, filename_prefix):
 def _download_single_tile(mask, region, scale, filename):
     import time
     if os.path.exists(filename) and os.path.getsize(filename) > 0:
-        return (True, filename, None)
+        return (True, filename, os.path.getsize(filename), None)
         
     max_retries = 3
     last_error = None

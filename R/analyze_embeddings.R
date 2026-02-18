@@ -3,11 +3,10 @@
 #' This function calculates the similarity between each location's embedding and the species centroid (mean embedding).
 #'
 #' @param df Data frame containing columns A00 to A63.
-#' @param method Mapping method: 'centroid' or 'standardized'.
-#' @param nuisance_vars Character vector of columns to treat as nuisance variables.
+#' @param method Mapping method: 'centroid' or 'ridge'.
 #' @return A list containing the results.
 #' @keywords internal
-analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, python_path = NULL, gee_project = NULL, cv = FALSE) {
+analyze_embeddings <- function(df, method = "centroid", python_path = NULL, gee_project = NULL, cv = FALSE) {
   python_path <- resolve_python_path(python_path)
 
   if (is.null(python_path)) {
@@ -30,11 +29,6 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, py
 
   if (!is.null(gee_project) && gee_project != "") {
     args <- c(args, "--project", shQuote(gee_project))
-  }
-
-
-  if (!is.null(nuisance_vars) && length(nuisance_vars) > 0) {
-    args <- c(args, "--nuisance-vars", paste(nuisance_vars, collapse = ","))
   }
 
   if (cv) {
@@ -60,31 +54,17 @@ analyze_embeddings <- function(df, method = "centroid", nuisance_vars = NULL, py
   unlink(tmp_out)
   unlink(meta_path)
 
-  if (method == "centroid") {
-    dot_products <- df_clean$similarity
-    mean_emb <- meta$centroid
+  dot_products <- df_clean$similarity
+  # Centroid extraction handling
+  mean_emb <- if (!is.null(meta$centroids)) meta$centroids[[1]] else meta$centroid
 
-    metrics <- meta$metrics
-    cbi <- if (!is.null(metrics$cbi)) metrics$cbi else NULL
-    auc <- if (!is.null(metrics$auc)) metrics$auc else NULL
+  metrics <- meta$metrics
 
-    # CBI and AUC are returned as metrics.
-
-    return(list(
-      mean_embedding = mean_emb,
-      dot_products = dot_products,
-      metrics = metrics,
-      data = df_clean,
-      method = "centroid"
-    ))
-  } else {
-    message("Maxent model trained.")
-    return(list(
-      data = df_clean,
-      method = method,
-      metrics = meta$metrics,
-      cv_results = meta$cv_results,
-      meta = meta
-    ))
-  }
+  return(list(
+    mean_embedding = mean_emb,
+    dot_products = dot_products,
+    metrics = metrics,
+    data = df_clean,
+    method = method
+  ))
 }

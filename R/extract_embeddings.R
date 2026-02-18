@@ -21,11 +21,9 @@ ee_auth_service <- function(json_path = Sys.getenv("GEE_SERVICE_ACCOUNT_KEY"), v
   message("GEE credentials set for system calls.")
 }
 
-#' @param background_method Optional. Method to generate background points ("sample_extent" or "buffer").
-#' @param background_buffer Optional. Numeric vector of length 2: c(min_dist, max_dist).
 #' @return A data frame with added A00-A63 embedding columns.
 #' @keywords internal
-extract_embeddings <- function(df, scale = 10, python_path = NULL, gee_project = NULL, background_method = NULL, background_buffer = NULL) {
+extract_embeddings <- function(df, scale = 10, python_path = NULL, gee_project = NULL) {
   python_path <- resolve_python_path(python_path)
 
   if (is.null(python_path)) {
@@ -41,10 +39,8 @@ extract_embeddings <- function(df, scale = 10, python_path = NULL, gee_project =
 
   # 1. Identify unique coordinate-year combinations to avoid redundant GEE calls
   # This is crucial for multi-species datasets like SatBird where many species share locations.
-  # Include 'present' so the Python extractor can detect absences and skip background generation.
   dedup_cols <- c("longitude", "latitude", "year")
   keep_cols <- dedup_cols
-  if ("present" %in% names(df)) keep_cols <- c(keep_cols, "present")
   df_unique <- df[!duplicated(df[, dedup_cols]), keep_cols]
 
   # Create temp files
@@ -63,18 +59,6 @@ extract_embeddings <- function(df, scale = 10, python_path = NULL, gee_project =
 
   if (!is.null(gee_project) && gee_project != "") {
     args <- c(args, "--project", shQuote(gee_project))
-  }
-
-
-  if (!is.null(background_method)) {
-    args <- c(args, "--background-method", background_method)
-  }
-
-  if (!is.null(background_buffer)) {
-    if (length(background_buffer) != 2) {
-      stop("background_buffer must be a numeric vector of length 2: c(min_dist, max_dist)")
-    }
-    args <- c(args, "--background-buffer", background_buffer[1], background_buffer[2])
   }
 
   if (exists("sa_json_key") && !is.null(sa_json_key) && sa_json_key != "") {

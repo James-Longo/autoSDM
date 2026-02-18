@@ -1,20 +1,20 @@
 # autoSDM: High-Resolution SDM with Alpha Earth Embeddings
 
-`autoSDM` is a state-of-the-art toolset for Species Distribution Modeling (SDM) that leverages Google's **Alpha Earth satellite embeddings**. By using 64-dimensional dense vectors representing the earth's surface characteristics, `autoSDM` eliminates the need for manual covariate selection and provides unprecedented 10m-resolution mapping capabilities.
+`autoSDM` is a toolset for Species Distribution Modeling (SDM) that leverages Google's Alpha Earth satellite embeddings. By using 64-dimensional dense vectors representing the earth's surface characteristics, `autoSDM` simplifies covariate management and provides 10m-resolution mapping capabilities.
 
-## 🎯 Key Features
+## Key Features
 
-- **Multi-Model Support**: Choose between **Centroid** (Presence-Only) and **Maxent** (Presence/Absence) approaches.
-- **Robust Characterization**: Uses the **Geometric Median** to define the species' environmental centroid, providing high resistance to outliers in ecological niche space.
-- **Unified Ensemble**: Generate "Agreement Maps" by ensembling multiple models (e.g., Centroid $\times$ Maxent) to highlight high-confidence habitat.
-- **Hierarchical Filtering**: Efficiency at scale. Use 1000m coarse models to mask the compute-heavy 10m high-resolution runs.
-- **Big-Data Ready**: Automatically handles multi-gigabyte rasters using windowed, memory-efficient merging and 32-worker parallel downloads.
+- **Presence-Only Modeling**: Automatically defaults to Similarity Search (Centroid) when only presence data is available.
+- **Arithmetic Mean Centroids**: Uses the Arithmetic Mean to define environmental centroids in ecological niche space, ensuring rapid and robust characterization.
+- **Presence-Absence Modeling**: Automatically applies Ridge Regression (Linear) when validated absences are present.
+- **Flexible Mapping**: Generate individual distribution maps or combined "Agreement Maps" by ensembling multiple models (e.g., Centroid * Ridge).
+- **Big-Data Ready**: Automatically handles large rasters using windowed, memory-efficient merging and parallelized downloads.
 
 ---
 
-## � Installation
+## Installation
 
-To install `autoSDM` directly from GitHub:
+To install autoSDM directly from GitHub:
 
 ```r
 # install.packages("devtools")
@@ -22,82 +22,65 @@ devtools::install_github("James-Longo/autoSDM")
 ```
 
 **Python Setup:**
-`autoSDM` automatically handles Python dependencies. On your first run, it will check your active Python environment (via `reticulate`) and install required packages (`earthengine-api`, `pandas`, `geopandas`, etc.) if they are missing.
-
-*Ensure you have Python installed on your system.*
+autoSDM automatically handles Python dependencies via reticulate. On your first run, it will check your active Python environment and install required packages (earthengine-api, pandas, geopandas, etc.) if they are missing.
 
 **Google Earth Engine:**
-You must have a GEE account. Before running the package, ensure you have authenticated and initialized your Earth Engine session:
-
-```r
-library(rgee)
-# One-time authentication
-ee_Authenticate()
-
-# Initialize session (required for every session)
-ee_Initialize()
-```
-
-If you are using a specific Google Cloud project, provide it during initialization: `ee_Initialize(project = "your-project-id")`.
+You must have a Google Earth Engine account. The package will attempt to auto-discover your GEE project or prompt you to select one from your authorized projects.
 
 ---
 
-## �🚀 Quick Start (R)
+## Quick Start (R)
 
 ```r
 library(autoSDM)
 
-# 1. Format your data
+# 1. Format your data (Standardizes columns to longitude, latitude, year, present)
 data <- format_data(raw_data, coords = c("lon", "lat"), year = "date", presence = "presence")
 
-# 2. Run the full pipeline
-# Extrapolates an ensemble model to a 10km radius around a central point
+# 2. Run the pipeline
+# Automatically detects if data is Presence-Only or Presence-Absence
+# Generates a distribution map for the specified area of interest (AOI)
 results <- autoSDM(data, aoi = list(lat=44.5, lon=-71.5, radius=10000))
 ```
 
 ---
 
-## 🛠 Core Pipeline
+## Core Pipeline
 
-The pipeline is driven by three primary CLI commands. All results, including GeoTIFF maps and metadata JSONs, are automatically organized within the `outputs/` directory.
+The pipeline is driven by three primary stages, which can be invoked together via the main R function or separately via the CLI.
 
 ### 1. Extract
 Extracts Alpha Earth embeddings from Google Earth Engine for a set of occurrences.
 - **Scale-Aware**: Native support for 10m, 100m, and 1000m scales.
-- **Temporal Alignment**: Automatically matches observation years (2017–2024) to the correct embedding mosaic.
+- **Temporal Alignment**: Automatically matches observation years (2017-2025) to the correct embedding mosaic.
 
 ### 2. Analyze
-Trains the selected model and determines ecological thresholds.
-- **Presence-Only (Centroid)**: Calculates the Geometric Median and dot-product similarity.
-- **Presence/Absence (Maxent)**: Trains a classifier and optimizes predictions for detection bias.
-- **Advanced Tuning**: Automatically calculates **95% TPR**, **95% TNR**, **Balanced**, and **AUC** metrics.
+Trains the selected model and determines ecological metrics.
+- **Presence-Only (Centroid)**: Calculates the mean of presence embeddings and dot-product similarity.
+- **Presence-Absence (Ridge)**: Trains a linear ridge regression model (presence=1, absence=-1).
+- **Validation**: Automatically calculates continuous Boyce Index (CBI), AUC-ROC, and AUC-PR metrics.
 
-### 3. Extrapolate & Ensemble
-Projects models onto high-resolution maps.
-- **Memory-Efficient**: Uses windowed-writing to merge thousands of GEE tiles into a single seamless GeoTIFF without crashing your local RAM.
-- **Ensemble Mode**: Combine model outputs (e.g., `maxent * centroid`) to identify areas of strict agreement.
-- **Parallel downloads**: 32 threads ensure maximum throughput from the GEE servers.
+### 3. Extrapolate
+Projects models onto maps.
+- **Efficient Generation**: Projects model weights directly on GEE servers where possible.
+- **Parallel downloads**: High-throughput tiling system for downloading large AOIs.
 
 ---
 
-## 📁 Output Structure
+## Output Structure
 
-Results are organized into project-specific and model-specific subdirectories within the `outputs/` folder for clarity:
+Results are organized into project-specific files within your specified results directory (e.g., `benchmarks/[species_name]/results/`):
 
 ```text
-outputs/[project_name]/
-├── centroid/
-│   ├── centroid_10m.tif          (Continuous Similarity Map)
-│   ├── centroid_results.csv.json (Model metadata & Centroid vector)
-│   └── centroid.log              (Execution diagnostics)
-├── maxent/
-│   ├── maxent_10m.tif            (Maxent Probability Map)
-│   └── maxent.log
-└── ensemble/
-    └── ensemble_10m.tif          (Agreement Map: Centroid * Maxent)
+[project_name]/
+├── centroid.tif    (Similarity Map - generated if PO data used)
+├── ridge.tif       (Suitability Map - generated if PA data used)
+├── centroid.json   (Model metadata, centroids, and validation metrics)
+├── ridge.json      (Model weights and validation metrics)
+└── results.json    (Combined summary for the run)
 ```
 
 ---
 
-## ⚖️ License & Credits
+## License and Credits
 Developed for Advanced Species Distribution Modeling. Leverages the Alpha Earth Embedding dataset provided by Google.

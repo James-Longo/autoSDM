@@ -1,24 +1,21 @@
 #' autoSDM: Automated Species Distribution Modeling
 #'
 #' This is the main entry point for the autoSDM pipeline. It performs embedding extraction,
-#' multi-model analysis (Centroid + Maxent), and generates an ensemble extrapolation map.
+#' multi-model analysis (Centroid + Ridge), and generates high-resolution distribution maps.
 #'
 #' @param data A data frame formatted via `format_data()`. Must have standardized lowercase columns
-#'   (longitude, latitude, year, present). Any additional columns are treated as nuisance variables.
+#'   (longitude, latitude, year, present). Any additional columns are ignored.
 #' @param aoi Optional. Either a list with `lat`, `lon`, and `radius` (in meters), or a character string path to a polygon file (GeoJSON or Shapefile). Required for map generation. If NULL and `predict_coords` is provided, only point predictions are returned (no map).
 #' @param output_dir Optional. Directory to save results. Defaults to the current working directory.
 #' @param scale Optional. Resolution in meters for the final map. Defaults to 10.
-#' @param background_method Optional. Method to generate background points if presence-only data is provided. Defaults to "sample_extent". Options: "sample_extent", "buffer".
-#' @param background_buffer Optional. Numeric vector of length 2: c(min_dist, max_dist) in meters for buffer-based sampling.
 #' @param python_path Optional. Path to Python executable. Auto-detected if not provided.
 #' @param gee_project Optional. Google Cloud Project ID for Earth Engine. Required for newer API versions.
 #' @param cv Optional. Boolean whether to run 5-fold Spatial Block Cross-Validation. Defaults to FALSE.
 #' @param predict_coords Optional. Data frame of coordinates to predict at.
-#' @param methods Character vector of methods to run. Default is c("centroid", "maxent").
-#' @param k Optional. Force a specific number of clusters for centroid analysis.
+#' @param year Optional. Alpha Earth Mosaic year for mapping. Defaults to 2025.
 #' @return A list containing training data, models, and prediction results.
 #' @export
-autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, background_method = "sample_extent", background_buffer = NULL, python_path = NULL, gee_project = NULL, cv = FALSE, predict_coords = NULL, methods = c("ridge", "knn1", "knn3"), k = NULL) {
+autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_path = NULL, gee_project = NULL, cv = FALSE, predict_coords = NULL, methods = NULL, year = 2025) {
   # Validate: need at least aoi or predict_coords
   if (is.null(aoi) && is.null(predict_coords)) {
     stop("You must provide either 'aoi' (for map generation) or 'predict_coords' (for point predictions), or both.")
@@ -33,13 +30,25 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, backgrou
     ))
   }
 
-  # 2. Auto-detect nuisance variables
-  standard_cols <- c("longitude", "latitude", "year", "present")
-  emb_cols <- sprintf("A%02d", 0:63)
-  all_cols <- names(data)
-  nuisance_vars <- setdiff(all_cols, c(standard_cols, emb_cols, "species")) # Exclude species from nuisance
-  if (length(nuisance_vars) > 0) {
-    message(sprintf("Detected nuisance variables: %s", paste(nuisance_vars, collapse = ", ")))
+
+
+  # 2b. Check if data is Presence-Only (no absences)
+  has_absences <- "present" %in% names(data) && any(data$present == 0)
+  
+  if (is.null(methods)) {
+    methods <- if (has_absences) "ridge" else "centroid"
+  }
+
+  # Support "ensemble" as a method keyword
+  requested_ensemble <- "ensemble" %in% methods
+  if (requested_ensemble) {
+    # Remove "ensemble" from individual methods and ensure at least centroid/ridge
+    methods <- setdiff(methods, "ensemble")
+    methods <- unique(c(methods, "centroid", "ridge"))
+  }
+  
+  if (length(methods) > 1) {
+    requested_ensemble <- TRUE
   }
 
   # 3. Python Configuration
@@ -78,18 +87,24 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, backgrou
     data,
     scale = scale,
     python_path = python_path,
-    gee_project = gee_project,
-    background_method = background_method,
-    background_buffer = background_buffer
+    gee_project = gee_project
   )
 
-  # 6. Determine if multi-species or single species
+  # 4. Decide on Multi-Species
   is_multi_species <- "species" %in% names(embedded_data) && length(unique(embedded_data$species)) > 1
+  
+  # 5. Prepare AOI arguments
+  aoi_arg <- NULL
+  if (is.list(aoi) && !is.null(aoi$lat)) {
+    aoi_arg <- c("--lat", aoi$lat, "--lon", aoi$lon, "--radius", aoi$radius)
+  } else if (is.character(aoi)) {
+    aoi_arg <- c("--aoi-path", shQuote(aoi))
+  }
 
-  # Path for shared training data
-  message("--- Preparing training data ---")
-
-  extract_csv <- file.path(output_dir, "autoSDM_training_data.csv")
+  # 6. Extraction/Preparation
+  # (Standardizing CSV output for Python)
+  extract_csv <- tempfile(fileext = ".csv")
+  # embedded_data is already extracted from step 5
   if (requireNamespace("vroom", quietly = TRUE)) {
     vroom::vroom_write(embedded_data, extract_csv, delim = ",")
   } else {
@@ -97,41 +112,50 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, backgrou
   }
 
   if (!is_multi_species) {
-    # SINGLE SPECIES WORKFLOW
     message("--- Single-Species Mode ---")
-
-    nuisance_arg <- if (length(nuisance_vars) > 0) c("--nuisance-vars", paste(nuisance_vars, collapse = ",")) else NULL
     cv_arg <- if (cv) "--cv" else NULL
     proj_arg <- if (!is.null(gee_project)) c("--project", shQuote(gee_project)) else NULL
 
-    # Track generated metadata files for ensemble
-    meta_files <- c()
+    meta_files <- list()
 
     # Loop through requested methods
     for (m in methods) {
-      if (m == "centroid") {
-        message("--- Step: Running Centroid Analysis ---")
-        out <- file.path(output_dir, "centroid.csv")
-        k_arg <- if (!is.null(k)) c("--k", k) else NULL
-        system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(out), "--method", "centroid", "--scale", scale, cv_arg, proj_arg, k_arg))
-        meta_files <- c(meta_files, file.path(output_dir, "centroid.json"))
-      } else if (m == "maxent") {
-        message("--- Step: Running Maxent Analysis ---")
-        out <- file.path(output_dir, "maxent.csv")
-        system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(out), "--method", "maxent", "--scale", scale, nuisance_arg, cv_arg, proj_arg))
-        meta_files <- c(meta_files, file.path(output_dir, "maxent.json"))
-      } else if (m == "ridge") {
-        message("--- Step: Running Linear (Ridge) Analysis ---")
-        out <- file.path(output_dir, "ridge.csv")
-        system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(out), "--method", "ridge", "--scale", scale, cv_arg, proj_arg))
-        meta_files <- c(meta_files, file.path(output_dir, "ridge.json"))
-      } else if (grepl("^knn", m)) {
-        k_val <- as.integer(gsub("^knn", "", m))
-        if (is.na(k_val)) k_val <- 3
-        message(sprintf("--- Step: Running kNN (k=%d) Analysis ---", k_val))
-        out <- file.path(output_dir, paste0("knn", k_val, ".csv"))
-        system2(python_path, args = c("-m", "autoSDM.cli", "analyze", "--input", shQuote(extract_csv), "--output", shQuote(out), "--method", "knn", "--k", k_val, "--scale", scale, cv_arg, proj_arg))
-        meta_files <- c(meta_files, file.path(output_dir, paste0("knn", k_val, ".json")))
+      m_clean <- gsub("[^a-zA-Z0-9]", "", m)
+      message(sprintf("--- Step: Running %s Analysis ---", m))
+      
+      out_csv <- file.path(output_dir, paste0(m_clean, ".csv"))
+      out_json <- file.path(output_dir, paste0(m_clean, ".json"))
+      
+      # Determine specific method for Python
+      py_method <- if (grepl("^knn", m)) "knn" else m
+      
+      system2(python_path, args = c(
+        "-m", "autoSDM.cli", "analyze", 
+        "--input", shQuote(extract_csv), 
+        "--output", shQuote(out_csv), 
+        "--method", py_method, 
+        "--scale", scale, 
+        "--year", year, 
+        cv_arg, proj_arg, aoi_arg
+      ))
+      
+      if (file.exists(out_json)) {
+        meta_files[[m]] <- out_json
+        
+        # 7. Generate Individual Map for this method
+        if (!is.null(aoi)) {
+          message(sprintf("--- Step: Generating Individual Map (%s) ---", m))
+          system2(python_path, args = c(
+            "-m", "autoSDM.cli", "ensemble", 
+            "--input", shQuote(extract_csv), 
+            "--output", shQuote(file.path(output_dir, paste0(m_clean, "_results.json"))), 
+            "--meta", shQuote(out_json), 
+            "--scale", scale, 
+            "--prefix", m_clean, 
+            "--year", year, 
+            proj_arg, aoi_arg
+          ))
+        }
       }
     }
 
@@ -155,9 +179,10 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, backgrou
       }
     }
 
-    # 9. Generate Ensemble Map
-    if (!is.null(aoi)) {
-      message("--- Step: Generating Ensemble Map (using all methods) ---")
+    # 9. Generate Ensemble Map (if requested or multiple methods)
+    if (!is.null(aoi) && requested_ensemble) {
+      message("--- Step: Generating Ensemble Map (consensus of all methods) ---")
+      
       ensemble_results_json <- file.path(output_dir, "ensemble_results.json")
 
       # Build args with all meta files
@@ -165,7 +190,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, backgrou
       for (mf in meta_files) {
         if (file.exists(mf)) ensemble_args <- c(ensemble_args, "--meta", shQuote(mf))
       }
-      ensemble_args <- c(ensemble_args, "--scale", scale, "--prefix", "ensemble")
+      ensemble_args <- c(ensemble_args, "--scale", scale, "--prefix", "ensemble", "--year", year)
       if (!is.null(gee_project)) ensemble_args <- c(ensemble_args, "--project", shQuote(gee_project))
 
       if (is.list(aoi) && !is.null(aoi$lat)) {
@@ -178,12 +203,11 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, backgrou
       if (status != 0) stop("Ensemble extrapolation failed.")
       final_results <- jsonlite::fromJSON(ensemble_results_json)
     } else {
+      # For single results, we return the last json generated or empty list
+      # The individual maps are already handled in the loop.
       final_results <- list()
-      for (mf in meta_files) {
-        if (file.exists(mf)) {
-          m_name <- gsub(".json", "_meta", basename(mf))
-          final_results[[m_name]] <- jsonlite::fromJSON(mf)
-        }
+      if (length(meta_files) > 0) {
+          final_results <- jsonlite::fromJSON(meta_files[[1]])
       }
     }
 
@@ -196,7 +220,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, backgrou
     message(sprintf("--- Multi-Species Mode: Processing %d species ---", length(unique(embedded_data$species))))
     message("Orchestrating GEE server-side parallelization...")
 
-    nuisance_arg <- if (length(nuisance_vars) > 0) c("--nuisance-vars", paste(nuisance_vars, collapse = ",")) else NULL
+
     cv_arg <- if (cv) "--cv" else NULL
     proj_arg <- if (!is.null(gee_project)) c("--project", shQuote(gee_project)) else NULL
 
@@ -216,7 +240,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, backgrou
       "--method", "ensemble",
       "--species-col", "species",
       "--scale", scale,
-      nuisance_arg,
+      "--year", year,
       cv_arg,
       proj_arg,
       aoi_arg
@@ -229,7 +253,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, backgrou
     species_list <- unique(embedded_data$species)
     results_list <- list()
     for (sp in species_list) {
-      res_path <- file.path(output_dir, sp, "ensemble_results.json")
+      res_path <- file.path(output_dir, sp, "results.json")
       if (file.exists(res_path)) {
         results_list[[sp]] <- jsonlite::fromJSON(res_path)
       }
