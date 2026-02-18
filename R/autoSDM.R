@@ -118,6 +118,43 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
 
     meta_files <- list()
 
+    # Shared Background logic for Presence-Only
+    # If any model needs background (centroid/ridge) and we don't have absences yet.
+    needs_bg <- any(methods %in% c("centroid", "ridge")) && 
+                !("present" %in% names(embedded_data) && any(embedded_data$present == 0))
+    
+    if (needs_bg && (!is.null(aoi) || !is.null(aoi_arg))) {
+      message("--- Step: Generating Shared Background Points (10:1) ---")
+      bg_csv <- tempfile(fileext = ".csv")
+      n_bg <- nrow(embedded_data) * 10
+      
+      system2(python_path, args = c(
+        "-m", "autoSDM.cli", "background",
+        "--output", shQuote(bg_csv),
+        "--count", n_bg,
+        "--scale", scale,
+        "--year", year,
+        proj_arg, aoi_arg
+      ))
+      
+      if (file.exists(bg_csv)) {
+        bg_data <- read.csv(bg_csv)
+        if (!"present" %in% names(bg_data)) bg_data$present <- 0
+        if (!"present" %in% names(embedded_data)) embedded_data$present <- 1
+        
+        # Ensure column alignment
+        common_cols <- intersect(names(embedded_data), names(bg_data))
+        embedded_data <- rbind(embedded_data[, common_cols], bg_data[, common_cols])
+        
+        # Update standardized CSV with background points
+        if (requireNamespace("vroom", quietly = TRUE)) {
+          vroom::vroom_write(embedded_data, extract_csv, delim = ",")
+        } else {
+          write.csv(embedded_data, extract_csv, row.names = FALSE)
+        }
+      }
+    }
+
     # Loop through requested methods
     for (m in methods) {
       m_clean <- gsub("[^a-zA-Z0-9]", "", m)

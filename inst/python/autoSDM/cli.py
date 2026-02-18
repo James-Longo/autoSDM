@@ -140,8 +140,8 @@ def run_multi_species_pipeline(args, df, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="autoSDM CLI")
-    parser.add_argument("mode", choices=["extract", "analyze", "extrapolate", "ensemble", "predict"])
-    parser.add_argument("--input", required=True)
+    parser.add_argument("mode", choices=["extract", "analyze", "extrapolate", "ensemble", "predict", "background"])
+    parser.add_argument("--input", required=False)
     parser.add_argument("--output", required=True)
     parser.add_argument("--key", help="Optional GEE service account key path. If not provided, uses existing session auth.")
     parser.add_argument("--project", help="Google Cloud Project ID for Earth Engine initialization.")
@@ -161,9 +161,8 @@ def main():
     parser.add_argument("--lon", type=float, help="Longitude for AOI center")
     parser.add_argument("--radius", type=float, help="Radius (in meters) for AOI")
     parser.add_argument("--species-col", help="Column name for species in multi-species mode.")
-
-    
-    parser.add_argument("--cv", action="store_true", help="Run 5-fold Spatial Block Cross-Validation.")
+    parser.add_argument("--count", type=int, default=1000, help="Number of background points to sample.")
+    parser.add_argument("--cv", action="store_true", help="Run spatial block cross-validation.")
     parser.add_argument("--year", type=int, default=2025, help="Alpha Earth Mosaic year for mapping (default: 2025)")
     
     args = parser.parse_args()
@@ -180,6 +179,36 @@ def main():
         res.to_csv(args.output, index=False)
         sys.stderr.write(f"Extraction complete at {args.scale}m. Results saved to {args.output}\n")
         
+    elif args.mode == "background":
+        # Background Sampling Mode
+        import ee
+        try: ee.Initialize(project=args.project) if args.project else ee.Initialize()
+        except: pass
+
+        # Reconstruct AOI
+        aoi = None
+        if args.lat is not None and args.lon is not None and args.radius is not None:
+            aoi = ee.Geometry.Point([args.lon, args.lat]).buffer(args.radius)
+        elif args.aoi_path:
+            import geopandas as gpd
+            gdf = gpd.read_file(args.aoi_path)
+            if gdf.crs and gdf.crs.to_epsg() != 4326: gdf = gdf.to_crs(epsg=4326)
+            bounds = gdf.total_bounds
+            aoi = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+        
+        if not aoi:
+            sys.stderr.write("Error: AOI required for background sampling (lat/lon/radius or aoi-path).\n")
+            sys.exit(1)
+
+        from autoSDM.trainer import get_background_embeddings
+        sys.stderr.write(f"Sampling {args.count} background points from GEE...\n")
+        df_bg = get_background_embeddings(aoi, n_points=args.count, scale=args.scale, year=args.year)
+        
+        os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
+        df_bg.to_csv(args.output, index=False)
+        sys.stderr.write(f"Background sampling complete. Results saved to {args.output}\n")
+        sys.exit(0)
+
     elif args.mode == "analyze":
         df = pd.read_csv(args.input)
         

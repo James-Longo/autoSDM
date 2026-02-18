@@ -318,47 +318,52 @@ def get_background_embeddings(aoi, n_points=1000, scale=100, year=2025):
     Samples random background points in GEE and extracts their Alpha Earth embeddings.
     """
     import ee
+    import pandas as pd
+    import json # Added import for json
     sys.stderr.write(f"Sampling {n_points} background points from GEE (Year: {year})...\n")
     
-    # Generate random points within AOI
-    bg_points = ee.FeatureCollection.randomPoints(aoi, n_points)
+    # Generate excessive random points within AOI to account for water/missing data
+    # We oversample by 5x (down from 20x to avoid memory issues) and then filter+limit 
+    # to get exactly n_points on land
+    oversample_factor = 5
+    bg_points_pool = ee.FeatureCollection.randomPoints(aoi, n_points * oversample_factor)
     
     # Extract embeddings
     asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
     year_img = ee.ImageCollection(asset_path).filter(ee.Filter.calendarRange(int(year), int(year), 'year')).mosaic()
     emb_cols = [f"A{i:02d}" for i in range(64)]
     
+    # Sample embeddings and filter to keep only points on land (where A00 exists)
     sampled = year_img.sampleRegions(
-        collection=bg_points,
+        collection=bg_points_pool,
         scale=scale,
         geometries=True
-    ).filter(ee.Filter.notNull(['A00']))
+    ).filter(ee.Filter.notNull(['A00'])).limit(n_points)
     
-    # Download to local DataFrame
-    # Note: .geo property contains the point location
-    res = sampled.reduceColumns(
-        reducer=ee.Reducer.toList().repeat(64 + 1), # embs + .geo
-        selectors=emb_cols + ['.geo']
-    ).getInfo()
-    
-    if not res['list'] or len(res['list'][0]) == 0:
+    # Download to local 
+    # Using more robust .getInfo() on features
+    try:
+        res = sampled.getInfo()
+    except Exception as e:
+        sys.stderr.write(f"Error during GEE background sampling: {e}\n")
+        return pd.DataFrame()
+
+    if not res['features']:
         sys.stderr.write("Warning: GEE background sampling returned no points.\n")
         return pd.DataFrame()
         
     data = []
-    for i in range(len(res['list'][0])):
-        row = {}
-        for j, col in enumerate(emb_cols):
-            row[col] = res['list'][j][i]
-        
-        # Parse .geo
-        geo = json.loads(res['list'][64][i]) if isinstance(res['list'][64][i], str) else res['list'][64][i]
-        row['longitude'] = geo['coordinates'][0]
-        row['latitude'] = geo['coordinates'][1]
-        row['year'] = int(year)
-        row['present'] = 0
-        data.append(row)
-        
+    for f in res['features']:
+        row = f['properties']
+        geom = f['geometry']
+        if geom and 'coordinates' in geom:
+            row['longitude'] = geom['coordinates'][0]
+            row['latitude'] = geom['coordinates'][1]
+            row['year'] = int(year) # Add year to each row
+            row['present'] = 0 # Add present=0 to each row
+            data.append(row)
+    
     df_bg = pd.DataFrame(data)
-    sys.stderr.write(f"Successfully sampled {len(df_bg)} background points.\n")
+    sys.stderr.write(f"Background sampling complete. Collected {len(df_bg)} points on land.\n")
     return df_bg
+
