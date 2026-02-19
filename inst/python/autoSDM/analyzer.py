@@ -143,10 +143,15 @@ def analyze_embeddings(df, class_property='present'):
 
     emb_cols = [f"A{i:02d}" for i in range(64)]
     
-    # Check if all columns exist
-    missing = [c for c in emb_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing embedding columns: {missing}")
+    # Robustly handle lowercase vs uppercase embedding columns
+    if not all(c in df.columns for c in emb_cols):
+        lower_cols = [f"a{i:02d}" for i in range(64)]
+        if all(c in df.columns for c in lower_cols):
+            # Rename lowercase to uppercase
+            df = df.rename(columns={l: u for l, u in zip(lower_cols, emb_cols)})
+        else:
+            missing = [c for c in emb_cols if c not in df.columns]
+            raise ValueError(f"Missing embedding columns: {missing}")
     
     # Auto-detect presence column - try common variations
     if class_property not in df.columns:
@@ -210,8 +215,12 @@ def analyze_ridge(df, class_property='present'):
     """
     from sklearn.linear_model import Ridge
     import sys
-
     emb_cols = [f"A{i:02d}" for i in range(64)]
+    if not all(c in df.columns for c in emb_cols):
+        lower_cols = [f"a{i:02d}" for i in range(64)]
+        if all(c in df.columns for c in lower_cols):
+            df = df.rename(columns={l: u for l, u in zip(lower_cols, emb_cols)})
+            
     df_clean = df.dropna(subset=emb_cols + [class_property]).copy()
     
     X = df_clean[emb_cols].values

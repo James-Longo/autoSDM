@@ -1,0 +1,84 @@
+Initialized GEE using default session credentials (Project: 890838350016).
+Loading AOI from /home/james-longo/Projects/autoSDM/benchmarks/ebd_bicthr_unv_smp_relDec-2025/caribbean_aoi.geojson...
+AOI simplified to bounding box: [-84.88720703  17.6355957  -65.29487305  23.19042969]
+Ensemble mode: Loading 2 meta files: ['/home/james-longo/Projects/autoSDM/benchmarks/ebd_bicthr_unv_smp_relDec-2025/runs/v29_bith_winter_ensemble/centroid.json', '/home/james-longo/Projects/autoSDM/benchmarks/ebd_bicthr_unv_smp_relDec-2025/runs/v29_bith_winter_ensemble/ridge.json']
+Processing meta file 1/2: /home/james-longo/Projects/autoSDM/benchmarks/ebd_bicthr_unv_smp_relDec-2025/runs/v29_bith_winter_ensemble/centroid.json
+Using 2025 Alpha Earth Mosaic for mapping...
+  Normalizing layer to [0, 1] using range: 0.0097 to 0.7384
+Processing meta file 2/2: /home/james-longo/Projects/autoSDM/benchmarks/ebd_bicthr_unv_smp_relDec-2025/runs/v29_bith_winter_ensemble/ridge.json
+  Normalizing layer to [0, 1] using range: -1.9236 to 1.3755
+  After multiplying (normalized) /home/james-longo/Projects/autoSDM/benchmarks/ebd_bicthr_unv_smp_relDec-2025/runs/v29_bith_winter_ensemble/ridge.json, bands: ['similarity']
+Calculating ensemble accuracy metrics on training data...
+DEBUG: Validation FC size: 2
+DEBUG: Prediction Map bands: ['similarity']
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/james-longo/Projects/autoSDM/inst/python/autoSDM/cli.py", line 920, in <module>
+    main()
+  File "/home/james-longo/Projects/autoSDM/inst/python/autoSDM/cli.py", line 646, in main
+    info = sampled.getInfo()
+           ^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/ee/collection.py", line 589, in getInfo
+    return super().getInfo()
+           ^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/ee/computedobject.py", line 108, in getInfo
+    return data.computeValue(self)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/ee/data.py", line 1066, in computeValue
+    return _execute_cloud_call(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/ee/data.py", line 349, in _execute_cloud_call
+    return call.execute(num_retries=num_retries)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/googleapiclient/_helpers.py", line 130, in positional_wrapper
+    return wrapped(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/googleapiclient/http.py", line 923, in execute
+    resp, content = _retry_request(
+                    ^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/googleapiclient/http.py", line 191, in _retry_request
+    resp, content = http.request(uri, method, *args, **kwargs)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/google_auth_httplib2.py", line 216, in request
+    response, content = self.http.request(
+                        ^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/ee/_cloud_api_utils.py", line 79, in request
+    response = self._session.request(
+               ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/requests/adapters.py", line 644, in send
+    resp = conn.urlopen(
+           ^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/urllib3/connectionpool.py", line 787, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/urllib3/connectionpool.py", line 534, in _make_request
+    response = conn.getresponse()
+               ^^^^^^^^^^^^^^^^^^
+  File "/home/james-longo/.virtualenvs/r-autoSDM/lib/python3.12/site-packages/urllib3/connection.py", line 571, in getresponse
+    httplib_response = super().getresponse()
+                       ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/http/client.py", line 1448, in getresponse
+    response.begin()
+  File "/usr/lib/python3.12/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/http/client.py", line 297, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/socket.py", line 707, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/ssl.py", line 1252, in recv_into
+    return self.read(nbytes, buffer)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/ssl.py", line 1104, in read
+    return self._sslobj.read(len, buffer)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

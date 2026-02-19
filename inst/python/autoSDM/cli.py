@@ -154,7 +154,7 @@ def main():
     parser.add_argument("--gcs-bucket", help="GCS bucket name for server-side export (bypasses local download)")
     parser.add_argument("--wait", action="store_true", help="Wait for the export task(s) to complete and show progress updates.")
     parser.add_argument("--zip", action="store_true", help="Zip the output rasters (only for local download mode).")
-    parser.add_argument("--method", choices=["centroid", "ridge", "mean", "ensemble"], default="centroid", help="Modeling method. Use 'ridge' for presence-absence and 'centroid' for presence-only.")
+    parser.add_argument("--method", choices=["centroid", "ridge", "ensemble"], default="centroid", help="Modeling method. Use 'ridge' for presence-absence and 'centroid' for presence-only.")
     parser.add_argument("--prefix", help="Prefix for output raster filenames (default: 'prediction_map')")
     parser.add_argument("--only-similarity", action="store_true", help="Only generate/download similarity map (skip masks)")
     parser.add_argument("--lat", type=float, help="Latitude for AOI center")
@@ -166,6 +166,8 @@ def main():
     parser.add_argument("--year", type=int, default=2025, help="Alpha Earth Mosaic year for mapping (default: 2025)")
     
     args = parser.parse_args()
+    sys.stderr.write(f"DEBUG: autoSDM CLI starting. Mode={args.mode}, Input={args.input}\n")
+    sys.stderr.flush()
     
     if args.mode == "extract":
         # Coordinate-Centric Extraction 
@@ -248,11 +250,19 @@ def main():
                     from autoSDM.trainer import get_background_embeddings
                     n_bg = args.count if args.count else len(df) * 10
                     sys.stderr.write(f"Presence-only data detected for Centroid. Generating {n_bg} background points for evaluation (Override: {bool(args.count)})...\n")
+                    
+                    # Label existing points before adding background
+                    if 'type' not in df.columns:
+                        df['type'] = df['present'].map({1: 'presence', 0: 'absence'})
+
                     df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=args.year)
                     if not df_bg.empty:
                         df = pd.concat([df, df_bg], ignore_index=True)
                 else:
                     sys.stderr.write("Warning: No AOI provided, skipping background generation for Centroid metrics.\n")
+
+            if 'type' not in df.columns:
+                 df['type'] = df['present'].map({1: 'presence', 0: 'absence'})
 
             res = analyze_embeddings(df)
             # Save similarities
@@ -276,13 +286,21 @@ def main():
                 try: ee.Initialize()
                 except: pass
                 
-                sys.stderr.write("Running 10-fold Spatial Block Cross-Validation (Centroid + Ridge evaluation)...\n")
-                cv_res = run_parallel_cv(
+                sys.stderr.write("Running 10-fold Spatial k-Means Cross-Validation (Centroid + Ridge evaluation)...\n")
+                cv_results = run_parallel_cv(
                     df=df,
                     ecological_vars=[f"A{i:02d}" for i in range(64)],
                     scale=args.scale,
                     n_folds=10
                 )
+                
+                # Export CV points CSV
+                if 'df' in cv_results:
+                    cv_points_path = args.output.replace('.json', '_points.csv') if args.output.endswith('.json') else args.output + "_points.csv"
+                    cv_results['df'].to_csv(cv_points_path, index=False)
+                    sys.stderr.write(f"CV points with fold assignments saved to {cv_points_path}\n")
+
+                cv_res = cv_results['average']
                 
                 # Extract Ensemble metrics to separate file
                 if 'ensemble' in cv_res:
@@ -327,6 +345,11 @@ def main():
                 from autoSDM.trainer import get_background_embeddings
                 n_bg = args.count if args.count else len(df) * 10
                 sys.stderr.write(f"Presence-only data detected for Ridge. Generating {n_bg} background points on GEE (Override: {bool(args.count)})...\n")
+                
+                # Label existing points before adding background
+                if 'type' not in df.columns:
+                    df['type'] = df['present'].map({1: 'presence', 0: 'absence'})
+
                 df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=args.year)
                 if not df_bg.empty:
                     df = pd.concat([df, df_bg], ignore_index=True)
@@ -351,13 +374,21 @@ def main():
                 try: ee.Initialize()
                 except: pass
                 
-                sys.stderr.write("Running 10-fold Spatial Block Cross-Validation (Centroid + Ridge evaluation)...\n")
-                cv_res = run_parallel_cv(
+                sys.stderr.write("Running 10-fold Spatial k-Means Cross-Validation (Centroid + Ridge evaluation)...\n")
+                cv_results = run_parallel_cv(
                     df=df,
                     ecological_vars=[f"A{i:02d}" for i in range(64)],
                     scale=args.scale,
                     n_folds=10
                 )
+                
+                # Export CV points CSV
+                if 'df' in cv_results:
+                    cv_points_path = args.output.replace('.json', '_points.csv') if args.output.endswith('.json') else args.output + "_points.csv"
+                    cv_results['df'].to_csv(cv_points_path, index=False)
+                    sys.stderr.write(f"CV points with fold assignments saved to {cv_points_path}\n")
+
+                cv_res = cv_results['average']
                 
                 # Extract Ensemble metrics to separate file
                 if 'ensemble' in cv_res:
@@ -459,9 +490,7 @@ def main():
             intercept = meta['intercept']
             df_emb['similarity'] = np.dot(df_emb[emb_cols].values, weights) + intercept
             
-        elif method == "mean":
-            centroid = np.array(meta['centroid'])
-            df_emb['similarity'] = np.dot(df_emb[emb_cols].values, centroid)
+
 
 
         # 5. Save Results
@@ -469,14 +498,43 @@ def main():
         df_emb.to_csv(args.output, index=False)
         sys.stderr.write(f"Point predictions complete. Results saved to {args.output}\n")
 
-    elif args.mode == "ensemble":
-        if not args.meta:
+    elif args.mode == "extrapolate" or args.mode == "ensemble":
+        if not args.meta and args.mode != "ensemble":
             sys.stderr.write(f"Error: --meta required for {args.mode} mode\n")
             sys.exit(1)
             
         df = pd.read_csv(args.input)
-        from autoSDM.extrapolate import get_prediction_image
+        # Normalize column names to lowercase for consistency
+        df.columns = [c.lower() for c in df.columns]
+
+        # Ensure year column is present for extractor
+        if 'year' not in df.columns:
+            if 'observation date' in df.columns:
+                 sys.stderr.write("Deriving 'year' from 'observation date'...\n")
+                 # Use errors='coerce' to handle messy dates and fillna with args.year
+                 df['year'] = pd.to_datetime(df['observation date'], errors='coerce').dt.year
+                 df['year'] = df['year'].fillna(args.year).astype(int)
+            else:
+                 df['year'] = args.year
+
+        # Check for embeddings
+        emb_cols = [f"A{i:02d}" for i in range(64)]
+        
+        # If they are lowercase, rename to uppercase to satisfy analyzer/trainer
+        if all(col.lower() in df.columns for col in emb_cols):
+             df = df.rename(columns={col.lower(): col for col in emb_cols})
+             
+        has_embeddings = all(col in df.columns for col in emb_cols)
+        
         extractor = GEEExtractor(args.key, project=args.project) # Initialize GEE
+        if not has_embeddings:
+            sys.stderr.write("Environmental embeddings (A00-A63) missing. Extracting from GEE for CV and metrics...\n")
+            df = extractor.extract_embeddings(df, scale=args.scale)
+            if df.empty:
+                sys.stderr.write("Error: Failed to extract embeddings.\n")
+                sys.exit(1)
+
+        from autoSDM.extrapolate import get_prediction_image
 
         
         # Load Coarse Meta for Filtering (Optional)
@@ -574,6 +632,198 @@ def main():
                 prediction_map = prediction_map_raw
 
             thresholds = {}
+
+        # --- Evaluate Metrics on Training Data (Ensemble) ---
+        calculated_metrics = None
+        cv_res_data = None
+        if args.mode == "ensemble":
+            # Identify class property
+            class_prop = None
+            for c in ['present', 'presence', 'present?', 'presence?', 'status']:
+                if c in df.columns:
+                    class_prop = c
+                    break
+            
+            if class_prop is None:
+                # If not found, check if it's presence-only (all 1s) or if we need to CREATE it
+                sys.stderr.write("Class property not found. Assuming presence data and creating 'present' column...\n")
+                df['present'] = 1
+                class_prop = 'present'
+
+            # Ensure all entries have a value (1 for presence if we just created it)
+            df[class_prop] = df[class_prop].fillna(1)
+            
+            has_absences = (df[class_prop] == 0).any()
+            
+            if not has_absences:
+                from autoSDM.trainer import get_background_embeddings
+                n_bg = args.count if args.count else len(df) * 10
+                sys.stderr.write(f"Presence-only data detected for Ensemble evaluation. Generating {n_bg} background points on GEE...\n")
+                
+                # Use AOI from bounds or arguments
+                aoi_bg = aoi
+                if aoi_bg is None:
+                    min_lat, max_lat = df['latitude'].min(), df['latitude'].max()
+                    min_lon, max_lon = df['longitude'].min(), df['longitude'].max()
+                    aoi_bg = ee.Geometry.Rectangle([min_lon - 0.1, min_lat - 0.1, max_lon + 0.1, max_lat + 0.1])
+
+                # Label existing points
+                if 'type' not in df.columns:
+                    df['type'] = 'presence'
+
+                df_bg = get_background_embeddings(aoi_bg, n_points=n_bg, scale=args.scale, year=args.year)
+                if not df_bg.empty:
+                    # Sync columns (embeddings)
+                    df = pd.concat([df, df_bg], ignore_index=True)
+                    sys.stderr.write(f"Added {len(df_bg)} background points.\n")
+                    sys.stderr.flush()
+            
+            if class_prop in df.columns:
+                try:
+                    sys.stderr.write("Calculating ensemble accuracy metrics on training data...\n")
+                    from autoSDM.trainer import _prepare_training_data
+                    from autoSDM.analyzer import calculate_classifier_metrics
+
+                    if 'year' not in df.columns:
+                        df['year'] = args.year
+                        
+                    features = []
+                    
+                    # Helper for safe integer conversion
+                    def safe_int(v):
+                        try: return int(v)
+                        except: return 0
+                    
+                    # Group by class to creating optimized MultiPoint features
+                    unique_classes = df[class_prop].unique()
+                    for cls_val in unique_classes:
+                        subset = df[df[class_prop] == cls_val]
+                        if subset.empty: continue
+                        coords = subset[['longitude', 'latitude']].values.tolist()
+                        
+                        # Upload as individual points (safe for <5000)
+                        # This avoids sampleRegions/MultiPoint complexities
+                        for xy in coords:
+                            feat = ee.Feature(ee.Geometry.Point(xy), {class_prop: safe_int(cls_val)})
+                            features.append(feat)
+                            
+                    fc_eval = ee.FeatureCollection(features)
+                    
+                    try:
+                        sz = fc_eval.size().getInfo()
+                        sys.stderr.write(f"DEBUG: Validation FC size: {sz}\n")
+                        bnds = prediction_map.bandNames().getInfo()
+                        sys.stderr.write(f"DEBUG: Prediction Map bands: {bnds}\n")
+                        sys.stderr.flush()
+                    except Exception as e:
+                        sys.stderr.write(f"DEBUG: Failed to get info: {e}\n")
+
+                    # Sample prediction map at training locations
+                    sys.stderr.write("DEBUG: Starting sampleRegions...\n")
+                    sys.stderr.flush()
+                    sampled = prediction_map.sampleRegions(
+                        collection=fc_eval,
+                        scale=args.scale, 
+                        geometries=False,
+                        tileScale=16
+                    )
+
+                    # Retrieve results
+                    sys.stderr.write("DEBUG: Calling getInfo()...\n")
+                    sys.stderr.flush()
+                    info = sampled.getInfo()
+                    sys.stderr.write("DEBUG: Got info.\n")
+                    sys.stderr.flush()
+                    
+                    if info['features']:
+                        scs = []
+                        lbls = []
+                        # class_prop might have been renamed by _prepare_training_data (e.g. dots to underscores)
+                        # But we are using raw DF now, so it matches.
+                        safe_class_prop = class_prop 
+
+                        for f in info['features']:
+                            p = f['properties']
+                            # prediction_map band is 'similarity'
+                            if 'similarity' in p and safe_class_prop in p:
+                                scs.append(p['similarity'])
+                                lbls.append(p[safe_class_prop])
+                        
+                        scs = np.array(scs)
+                        lbls = np.array(lbls)
+                        
+                        pos = scs[lbls == 1]
+                        neg = scs[lbls == 0]
+                        
+                        if len(pos) > 0 and len(neg) > 0:
+                            calculated_metrics = calculate_classifier_metrics(pos, neg)
+                            sys.stderr.write(f"Ensemble Metrics: CBI={calculated_metrics.get('cbi', 0):.3f}, AUC-ROC={calculated_metrics.get('auc_roc', 0.5):.3f}\n")
+                        else:
+                            sys.stderr.write("Warning: Not enough points (presence/absence) for metrics calculation.\n")
+                    else:
+                        sys.stderr.write("Warning: Sampling returned no features (empty intersection?).\n")
+
+                except Exception as e:
+                    sys.stderr.write(f"Warning: Failed to calculate ensemble metrics: {e}\n")
+                    import traceback
+                    traceback.print_exc()
+
+            # --- Run 10-fold Spatial CV for Ensemble ---
+            if args.cv:
+                try:
+                    from autoSDM.trainer import run_parallel_cv
+                    
+                    # Label input df (presence vs absence)
+                    if 'type' not in df.columns:
+                        df['type'] = df[class_prop].map({1: 'presence', 0: 'absence'}).fillna('background')
+
+                    sys.stderr.write("\nRunning 10-fold Spatial k-Means Cross-Validation for Ensemble...\n")
+                    sys.stderr.flush()
+                    cv_results = run_parallel_cv(
+                        df=df,
+                        ecological_vars=[f"A{i:02d}" for i in range(64)],
+                        scale=args.scale,
+                        n_folds=10
+                    )
+                    
+                    # Export CV points CSV
+                    if 'df' in cv_results:
+                        cv_points_path = args.output.replace('.json', '_points.csv') if args.output.endswith('.json') else args.output + "_points.csv"
+                        cv_results['df'].to_csv(cv_points_path, index=False)
+                        sys.stderr.write(f"CV points with fold assignments saved to {cv_points_path}\n")
+
+                    # Report all folds
+                    sys.stderr.write("-" * 45 + "\n")
+                    sys.stderr.write(f"{'Fold':<6} | {'CBI':<10} | {'AUC-ROC':<10} | {'AUC-PR':<10}\n")
+                    sys.stderr.write("-" * 45 + "\n")
+                    for i, fold_res in enumerate(cv_results['folds']):
+                        m = fold_res['ensemble']
+                        sys.stderr.write(f"{i+1:<6} | {m.get('cbi',0):<10.3f} | {m.get('auc_roc',0.5):<10.3f} | {m.get('auc_pr',0):<10.3f}\n")
+                    sys.stderr.write("-" * 45 + "\n")
+                    
+                    # Report average
+                    avg = cv_results['average']['ensemble']
+                    sys.stderr.write(f"{'AVG':<6} | {avg['cbi']:<10.3f} | {avg['auc_roc']:<10.3f} | {avg['auc_pr']:<10.3f}\n")
+                    sys.stderr.write("-" * 45 + "\n\n")
+                    
+                    cv_res_data = {k: v for k, v in cv_results.items() if k != 'df'}
+                except Exception as e:
+                    sys.stderr.write(f"Warning: Failed to run ensemble CV: {e}\n")
+                    import traceback
+                    traceback.print_exc()
+                    cv_res_data = None
+            else:
+                cv_res_data = None
+
+            # Define meta for saving later
+            meta = {
+                "scale": args.scale,
+                "mode": "ensemble",
+                "metrics": calculated_metrics,
+                "cv_results": cv_res_data
+            }
+
+
         
         # Define output path base
         base_dir = os.path.dirname(args.output) if os.path.dirname(args.output) else "outputs"
@@ -800,8 +1050,16 @@ def main():
                                         zipf.write(f, os.path.basename(f))
                     results['zip_file'] = os.path.abspath(zip_path)
             
+            if calculated_metrics:
+                results['metrics'] = calculated_metrics
+            
+            if cv_res_data:
+                results['cv_results'] = cv_res_data
+
+            # Save results, filtering out non-serializable DataFrames
+            serializable_results = {k: v for k, v in results.items() if k not in ['df', 'results_df']}
             with open(args.output, 'w') as f:
-                json.dump(results, f)
+                json.dump(serializable_results, f)
                 
             if args.gcs_bucket:
                 sys.stderr.write(f"Export tasks started. Monitor via: https://code.earthengine.google.com/tasks\n")

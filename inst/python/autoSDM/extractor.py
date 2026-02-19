@@ -21,11 +21,13 @@ class GEEExtractor:
             credentials = ee.ServiceAccountCredentials(self.sa_email, json_key_path)
             ee.Initialize(credentials, project=project)
             sys.stderr.write(f"Initialized GEE with service account: {self.sa_email} (Project: {project})\n")
+            sys.stderr.flush()
         else:
             # Attempt to use session auth if no key is provided
             try:
                 ee.Initialize(project=project)
                 sys.stderr.write(f"Initialized GEE using default session credentials (Project: {project}).\n")
+                sys.stderr.flush()
             except Exception as e:
                 sys.stderr.write(f"GEE Initialization failed: {e}\n")
                 sys.stderr.write("Please run 'earthengine authenticate' or provide a service account key.\n")

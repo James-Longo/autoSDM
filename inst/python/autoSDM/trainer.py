@@ -8,42 +8,24 @@ from autoSDM.analyzer import calculate_classifier_metrics
 
 def assign_spatial_folds(df, n_folds=10, grid_size=None):
     """
-    Assigns fold IDs based on spatial grid blocks.
-    If grid_size is None, it is calculated dynamically to ensure ~100 blocks.
+    Assigns fold IDs based on spatial k-means clustering of points.
     """
+    from sklearn.cluster import KMeans
     df = df.copy()
     
-    if grid_size is None:
-        # Dynamic grid sizing
-        lat_min, lat_max = df['latitude'].min(), df['latitude'].max()
-        lon_min, lon_max = df['longitude'].min(), df['longitude'].max()
+    # Use spatial coordinates for clustering
+    coords = df[['latitude', 'longitude']].values
+    
+    # Deterministic K-Means clustering
+    kmeans = KMeans(n_clusters=n_folds, random_state=42, n_init=10)
+    df['fold'] = kmeans.fit_predict(coords)
+    
+    # Report cluster sizes
+    counts = df['fold'].value_counts().sort_index()
+    sys.stderr.write(f"Spatial K-Means Folding ({n_folds} clusters):\n")
+    for fold, count in counts.items():
+        sys.stderr.write(f"  Fold {fold}: {count} points\n")
         
-        lat_range = lat_max - lat_min
-        lon_range = lon_max - lon_min
-        
-        # Target roughly 10x10 = 100 blocks to allow for sufficient variation in 10 folds
-        # We take the larger dimension to drive the scale
-        max_dim = max(lat_range, lon_range)
-        grid_size = max_dim / 10.0
-        
-        # Ensure a minimum practical size (e.g. 100m ~ 0.001 deg) to avoid numerical issues
-        grid_size = max(grid_size, 0.001)
-        sys.stderr.write(f"Dynamic Spatial Blocking: Grid Size={grid_size:.4f} degrees (Extent: {lon_range:.2f}x{lat_range:.2f})\n")
-
-    df['grid_x'] = (df['longitude'] / grid_size).apply(np.floor)
-    df['grid_y'] = (df['latitude'] / grid_size).apply(np.floor)
-    
-    # Combine grid coordinates into a unique ID
-    df['grid_id'] = df['grid_x'].astype(str) + "_" + df['grid_y'].astype(str)
-    
-    unique_grids = df['grid_id'].unique()
-    np.random.seed(42) # Deterministic blocking
-    np.random.shuffle(unique_grids)
-    
-    # Assign grids to folds
-    grid_to_fold = {grid: i % n_folds for i, grid in enumerate(unique_grids)}
-    df['fold'] = df['grid_id'].map(grid_to_fold)
-    
     return df
 
 
@@ -324,7 +306,7 @@ def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, n_f
     avg = {}
     for m in ['centroid', 'ridge', 'ensemble']:
         avg[m] = {met: float(np.mean([r[m][met] for r in res])) for met in ['cbi', 'auc_roc', 'auc_pr']}
-    return avg
+    return {'average': avg, 'folds': res, 'df': df_f}
 
 def get_background_embeddings(aoi, n_points=1000, scale=100, year=2025):
     """
@@ -353,10 +335,12 @@ def get_background_embeddings(aoi, n_points=1000, scale=100, year=2025):
             
         # Generate random points geometrically (FAST)
         # We request the full n_points batch to maximize yield in each iteration
+        # Use a deterministic seed that changes per attempt to avoid repeated points
+        seed = attempt 
         request_n = n_points
-        sys.stderr.write(f"  Attempt {attempt+1}: Generating {request_n} random points (Need {needed})...\n")
+        sys.stderr.write(f"  Attempt {attempt+1}: Generating {request_n} random points (Need {needed}, Seed: {seed})...\n")
         
-        random_pts = ee.FeatureCollection.randomPoints(aoi, request_n)
+        random_pts = ee.FeatureCollection.randomPoints(aoi, request_n, seed=seed)
         
         # Extract embeddings at these points
         # sampleRegions is efficient because it only computes pixels at the points
@@ -389,7 +373,8 @@ def get_background_embeddings(aoi, n_points=1000, scale=100, year=2025):
             row = {
                 'longitude': geom[0],
                 'latitude': geom[1],
-                'present': 0
+                'present': 0,
+                'type': 'background'
             }
             # Add embeddings
             for col in emb_cols:
