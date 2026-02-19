@@ -12,6 +12,7 @@ import concurrent.futures
 from autoSDM.extractor import GEEExtractor
 from autoSDM.analyzer import analyze_embeddings
 from autoSDM.extrapolate import generate_prediction_map, download_mask, export_to_gcs, merge_rasters
+from shapely.geometry import mapping
 def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df, year=2025):
     import ee
     try:
@@ -66,6 +67,8 @@ def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df, ye
         
         # Prediction Map
         img, _ = get_prediction_image(meta, aoi=aoi, year=year)
+        if aoi:
+            img = img.clip(aoi)
         
         results = {
             "species": sp,
@@ -126,8 +129,8 @@ def run_multi_species_pipeline(args, df, output_dir):
         import geopandas as gpd
         gdf = gpd.read_file(args.aoi_path)
         if gdf.crs and gdf.crs.to_epsg() != 4326: gdf = gdf.to_crs(epsg=4326)
-        bounds = gdf.total_bounds
-        aoi = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+        # Use full polygon geometry instead of bounding box 
+        aoi = ee.Geometry(mapping(gdf.geometry.unary_union))
     
     # Run in parallel blocks of concurrent GEE requests.
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -195,8 +198,8 @@ def main():
             import geopandas as gpd
             gdf = gpd.read_file(args.aoi_path)
             if gdf.crs and gdf.crs.to_epsg() != 4326: gdf = gdf.to_crs(epsg=4326)
-            bounds = gdf.total_bounds
-            aoi = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+            # Use full polygon geometry
+            aoi = ee.Geometry(mapping(gdf.geometry.unary_union))
         
         if not aoi:
             sys.stderr.write("Error: AOI required for background sampling (lat/lon/radius or aoi-path).\n")
@@ -243,8 +246,8 @@ def main():
                     import geopandas as gpd
                     gdf = gpd.read_file(args.aoi_path)
                     if gdf.crs and gdf.crs.to_epsg() != 4326: gdf = gdf.to_crs(epsg=4326)
-                    bounds = gdf.total_bounds
-                    aoi = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+                    # Use full polygon geometry
+                    aoi = ee.Geometry(mapping(gdf.geometry.unary_union))
                 
                 if aoi:
                     from autoSDM.trainer import get_background_embeddings
@@ -334,8 +337,8 @@ def main():
                     import geopandas as gpd
                     gdf = gpd.read_file(args.aoi_path)
                     if gdf.crs and gdf.crs.to_epsg() != 4326: gdf = gdf.to_crs(epsg=4326)
-                    bounds = gdf.total_bounds
-                    aoi = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+                    # Use full polygon geometry
+                    aoi = ee.Geometry(mapping(gdf.geometry.unary_union))
                 else:
                     # Fallback to bounding box of presences
                     min_lat, max_lat = df['latitude'].min(), df['latitude'].max()
@@ -556,18 +559,16 @@ def main():
         elif args.aoi_path:
             sys.stderr.write(f"Loading AOI from {args.aoi_path}...\n")
             import geopandas as gpd
-            from shapely.geometry import mapping
             gdf = gpd.read_file(args.aoi_path)
             # Re-project to 4326 if needed
             if gdf.crs and gdf.crs.to_epsg() != 4326:
                 gdf = gdf.to_crs(epsg=4326)
             
             # Combine all features into one geometry
-            # If the GDF has many features, unary_union can be slow and create a massive payload.
-            # We use the total bounds (envelope) for GEE processing to avoid the 10MB payload limit.
-            bounds = gdf.total_bounds # [minx, miny, maxx, maxy]
-            aoi = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
-            sys.stderr.write(f"AOI simplified to bounding box: {bounds}\n")
+            # Use unary_union to get the actual borders
+            merged_geom = gdf.geometry.unary_union
+            aoi = ee.Geometry(mapping(merged_geom))
+            sys.stderr.write(f"AOI loaded from borders of {args.aoi_path}\n")
         
         if args.mode == "ensemble":
             meta_paths = args.meta
@@ -940,6 +941,10 @@ def main():
         else:
             # Download Mode or GCS Export Mode
             results = {}
+            
+            # Apply AOI clipping if available to respect non-rectangular borders
+            if aoi:
+                prediction_map = prediction_map.clip(aoi)
             
             if args.gcs_bucket:
                 # GCS Export Mode: Individual Rasters
