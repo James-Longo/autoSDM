@@ -794,18 +794,40 @@ def main():
                         sys.stderr.write(f"CV points with fold assignments saved to {cv_points_path}\n")
 
                     # Report all folds
-                    sys.stderr.write("-" * 45 + "\n")
-                    sys.stderr.write(f"{'Fold':<6} | {'CBI':<10} | {'AUC-ROC':<10} | {'AUC-PR':<10}\n")
-                    sys.stderr.write("-" * 45 + "\n")
+                    sys.stderr.write("-" * 65 + "\n")
+                    sys.stderr.write(f"{'Fold':<6} | {'Pres':<6} | {'BG':<6} | {'CBI':<10} | {'AUC-ROC':<10} | {'AUC-PR':<10}\n")
+                    sys.stderr.write("-" * 65 + "\n")
+                    
+                    csv_rows = []
                     for i, fold_res in enumerate(cv_results['folds']):
                         m = fold_res['ensemble']
-                        sys.stderr.write(f"{i+1:<6} | {m.get('cbi',0):<10.3f} | {m.get('auc_roc',0.5):<10.3f} | {m.get('auc_pr',0):<10.3f}\n")
-                    sys.stderr.write("-" * 45 + "\n")
+                        cnt = fold_res['counts']
+                        p_cnt = cnt.get('presence', 0)
+                        b_cnt = cnt.get('background', 0)
+                        
+                        sys.stderr.write(f"{i+1:<6} | {p_cnt:<6} | {b_cnt:<6} | {m.get('cbi',0):<10.3f} | {m.get('auc_roc',0.5):<10.3f} | {m.get('auc_pr',0):<10.3f}\n")
+                        
+                        csv_rows.append({
+                            'fold': i + 1,
+                            'presence_count': p_cnt,
+                            'background_count': b_cnt,
+                            'cbi': m.get('cbi', 0),
+                            'auc_roc': m.get('auc_roc', 0.5),
+                            'auc_pr': m.get('auc_pr', 0)
+                        })
                     
-                    # Report average
+                    sys.stderr.write("-" * 65 + "\n")
+                    
+                    # Report average (filtered for folds with presences)
                     avg = cv_results['average']['ensemble']
-                    sys.stderr.write(f"{'AVG':<6} | {avg['cbi']:<10.3f} | {avg['auc_roc']:<10.3f} | {avg['auc_pr']:<10.3f}\n")
-                    sys.stderr.write("-" * 45 + "\n\n")
+                    sys.stderr.write(f"{'AVG*':<6} | {'(val)':<6} | {'':<6} | {avg['cbi']:<10.3f} | {avg['auc_roc']:<10.3f} | {avg['auc_pr']:<10.3f}\n")
+                    sys.stderr.write("-" * 65 + "\n")
+                    sys.stderr.write("*Average excludes folds with 0 presence points.\n\n")
+
+                    # Export CV Metrics CSV
+                    cv_metrics_path = args.output.replace('.json', '_cv_metrics.csv') if args.output.endswith('.json') else args.output + "_cv_metrics.csv"
+                    pd.DataFrame(csv_rows).to_csv(cv_metrics_path, index=False)
+                    sys.stderr.write(f"CV metrics per fold saved to {cv_metrics_path}\n")
                     
                     cv_res_data = {k: v for k, v in cv_results.items() if k != 'df'}
                 except Exception as e:

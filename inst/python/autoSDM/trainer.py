@@ -281,7 +281,16 @@ def run_cv_fold(fold_idx, df, ecological_vars, class_property, scale):
     e_sims = normalize(e_sims) # Final normalization of the ensemble product
     e_metrics = calculate_classifier_metrics(e_sims[test_df[class_property] == 1], e_sims[test_df[class_property] == 0])
 
-    return {'centroid': c_metrics, 'ridge': r_metrics, 'ensemble': e_metrics}
+    # Calculate point counts for reporting
+    n_pos = int(np.sum(test_df[class_property] == 1))
+    n_neg = int(np.sum(test_df[class_property] == 0))
+
+    return {
+        'centroid': c_metrics, 
+        'ridge': r_metrics, 
+        'ensemble': e_metrics,
+        'counts': {'presence': n_pos, 'background': n_neg}
+    }
 
 def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, n_folds=10):
     df_f = assign_spatial_folds(df, n_folds=n_folds)
@@ -305,7 +314,16 @@ def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, n_f
     
     avg = {}
     for m in ['centroid', 'ridge', 'ensemble']:
-        avg[m] = {met: float(np.mean([r[m][met] for r in res])) for met in ['cbi', 'auc_roc', 'auc_pr']}
+        # Filter for folds that have presences to avoid skewed averages (0.5 AUC / 0 CBI)
+        valid_folds = [r for r in res if r['counts']['presence'] > 0]
+        if not valid_folds:
+            # Fallback if no fold has presences (shouldn't happen with valid data)
+            valid_folds = res
+            
+        avg[m] = {
+            met: float(np.mean([r[m][met] for r in valid_folds])) 
+            for met in ['cbi', 'auc_roc', 'auc_pr']
+        }
     return {'average': avg, 'folds': res, 'df': df_f}
 
 def get_background_embeddings(aoi, n_points=1000, scale=100, year=2025):
