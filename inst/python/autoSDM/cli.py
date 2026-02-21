@@ -13,6 +13,76 @@ from autoSDM.extractor import GEEExtractor
 from autoSDM.analyzer import analyze_embeddings
 from autoSDM.extrapolate import generate_prediction_map, download_mask, export_to_gcs, merge_rasters
 from shapely.geometry import mapping
+
+def get_cached_cv(args, df):
+    """
+    Runs cross-validation or loads from a shared temp cache file.
+    The cache dir is supplied by R via --cv-cache-dir (a tempdir path) so the
+    files never appear in the output directory. The points CSV is not persisted —
+    k-means fold assignment is deterministic (random_state=42), so re-running it
+    on the same data always produces the same splits.
+    """
+    import ee, json, os, sys, tempfile
+    from autoSDM.trainer import run_parallel_cv
+
+    # Use caller-supplied temp dir, or fall back to the system temp dir
+    cache_dir = getattr(args, 'cv_cache_dir', None) or tempfile.gettempdir()
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_json = os.path.join(cache_dir, "cv_cache.json")
+
+    train_methods = args.train_methods.split(",") if hasattr(args, 'train_methods') and args.train_methods else ["centroid", "ridge"]
+    eval_methods = args.eval_methods.split(",") if hasattr(args, 'eval_methods') and args.eval_methods else ["centroid", "ridge", "ensemble"]
+
+    # If already computed by an earlier pipelined run, check what's missing
+    missing_eval_methods = []
+    cv_results = {}
+    if os.path.exists(cache_json):
+        sys.stderr.write("CV: Loading previously computed CV results from cache...\n")
+        with open(cache_json, 'r') as f:
+            cv_results = json.load(f)
+
+        cached_methods = list(cv_results.get('average', {}).keys())
+        missing_eval_methods = [m for m in eval_methods if m not in cached_methods]
+
+        if not missing_eval_methods:
+            return cv_results
+        else:
+            sys.stderr.write(f"CV: Cache missing metrics for {missing_eval_methods}. Computing missing methods...\n")
+    else:
+        missing_eval_methods = eval_methods
+
+    try: ee.Initialize(project=args.project) if args.project else ee.Initialize()
+    except: pass
+
+    sys.stderr.write(f"Running 10-fold Spatial k-Means Cross-Validation (Training: {','.join(train_methods)} | Evaluating: {','.join(missing_eval_methods)})...\n")
+    new_cv_results = run_parallel_cv(
+        df=df,
+        ecological_vars=[f"A{i:02d}" for i in range(64)],
+        scale=args.scale,
+        year=args.year,
+        n_folds=10,
+        train_methods=train_methods,
+        eval_methods=missing_eval_methods
+    )
+
+    # Merge new results with existing cache (if any)
+    if 'average' in new_cv_results:
+        if not cv_results:
+            cv_results = new_cv_results
+        else:
+            cv_results['average'].update(new_cv_results['average'])
+            for i, fold in enumerate(cv_results['folds']):
+                if i < len(new_cv_results['folds']):
+                    for key in missing_eval_methods:
+                        if key in new_cv_results['folds'][i]:
+                            fold[key] = new_cv_results['folds'][i][key]
+
+        with open(cache_json, 'w') as f:
+            json.dump({k: v for k, v in cv_results.items() if k != 'df'}, f)
+
+    return cv_results
+
+
 def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df, year=2025):
     import ee
     try:
@@ -166,6 +236,9 @@ def main():
     parser.add_argument("--species-col", help="Column name for species in multi-species mode.")
     parser.add_argument("--count", type=int, default=None, help="Number of background points to sample.")
     parser.add_argument("--cv", action="store_true", help="Run spatial block cross-validation.")
+    parser.add_argument("--train-methods", help="Comma-separated list of methods to train during CV (e.g., 'centroid,ridge')")
+    parser.add_argument("--eval-methods", help="Comma-separated list of methods to evaluate during CV (e.g., 'ensemble')")
+    parser.add_argument("--cv-cache-dir", help="Directory for the inter-process CV cache file (default: system tempdir). Set to R's tempdir() to keep output folders clean.")
     parser.add_argument("--year", type=int, default=2025, help="Alpha Earth Mosaic year for mapping (default: 2025)")
     
     args = parser.parse_args()
@@ -267,9 +340,8 @@ def main():
             if 'type' not in df.columns:
                  df['type'] = df['present'].map({1: 'presence', 0: 'absence'})
 
-            res = analyze_embeddings(df)
-            # Save similarities
-            res['clean_data']['similarity'] = res['similarities']
+            res = analyze_embeddings(df, scale=args.scale, year=args.year)
+            # clean_data already contains a 'similarity' column from GEE scoring
             os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
             res['clean_data'].to_csv(args.output, index=False)
             
@@ -284,18 +356,7 @@ def main():
             }
             
             if args.cv:
-                from autoSDM.trainer import run_parallel_cv
-                import ee
-                try: ee.Initialize()
-                except: pass
-                
-                sys.stderr.write("Running 10-fold Spatial k-Means Cross-Validation (Centroid + Ridge evaluation)...\n")
-                cv_results = run_parallel_cv(
-                    df=df,
-                    ecological_vars=[f"A{i:02d}" for i in range(64)],
-                    scale=args.scale,
-                    n_folds=10
-                )
+                cv_results = get_cached_cv(args, df)
                 
                 # Export CV points CSV
                 if 'df' in cv_results:
@@ -303,7 +364,7 @@ def main():
                     cv_results['df'].to_csv(cv_points_path, index=False)
                     sys.stderr.write(f"CV points with fold assignments saved to {cv_points_path}\n")
 
-                cv_res = cv_results['average']
+                cv_res = cv_results.get('average', {})
                 
                 # Extract Ensemble metrics to separate file
                 if 'ensemble' in cv_res:
@@ -315,14 +376,14 @@ def main():
                     ensemble_meta = {
                         "method": "ensemble",
                         "metrics": ensemble_metrics, 
-                        "cv_results": {"ensemble": ensemble_metrics} 
+                        "cv_results": ensemble_metrics
                     }
                     
                     with open(ensemble_path, 'w') as f:
                         json.dump(ensemble_meta, f)
                     sys.stderr.write(f"Ensemble metrics saved to {ensemble_path}\n")
                 
-                meta["cv_results"] = cv_res
+                meta["cv_results"] = cv_res.get('centroid')
 
         elif args.method == "ridge":
             from autoSDM.analyzer import analyze_ridge
@@ -358,7 +419,7 @@ def main():
                     df = pd.concat([df, df_bg], ignore_index=True)
 
             res = analyze_ridge(df)
-            res['clean_data']['similarity'] = res['similarities']
+            # clean_data already contains a 'similarity' column from GEE scoring
             os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
             res['clean_data'].to_csv(args.output, index=False)
             meta = {
@@ -372,18 +433,7 @@ def main():
             }
 
             if args.cv:
-                from autoSDM.trainer import run_parallel_cv
-                import ee
-                try: ee.Initialize()
-                except: pass
-                
-                sys.stderr.write("Running 10-fold Spatial k-Means Cross-Validation (Centroid + Ridge evaluation)...\n")
-                cv_results = run_parallel_cv(
-                    df=df,
-                    ecological_vars=[f"A{i:02d}" for i in range(64)],
-                    scale=args.scale,
-                    n_folds=10
-                )
+                cv_results = get_cached_cv(args, df)
                 
                 # Export CV points CSV
                 if 'df' in cv_results:
@@ -391,7 +441,7 @@ def main():
                     cv_results['df'].to_csv(cv_points_path, index=False)
                     sys.stderr.write(f"CV points with fold assignments saved to {cv_points_path}\n")
 
-                cv_res = cv_results['average']
+                cv_res = cv_results.get('average', {})
                 
                 # Extract Ensemble metrics to separate file
                 if 'ensemble' in cv_res:
@@ -403,14 +453,14 @@ def main():
                     ensemble_meta = {
                         "method": "ensemble",
                         "metrics": ensemble_metrics, 
-                        "cv_results": {"ensemble": ensemble_metrics} 
+                        "cv_results": ensemble_metrics
                     }
                     
                     with open(ensemble_path, 'w') as f:
                         json.dump(ensemble_meta, f)
                     sys.stderr.write(f"Ensemble metrics saved to {ensemble_path}\n")
                 
-                meta["cv_results"] = cv_res
+                meta["cv_results"] = cv_res.get('ridge')
         elif args.method == "mean":
             from autoSDM.analyzer import analyze_mean
             res = analyze_mean(df)
@@ -457,7 +507,7 @@ def main():
             sys.exit(1)
             
         # 2. Load Metadata
-        with open(args.meta) as f:
+        with open(args.meta[0]) as f:
             meta = json.load(f)
         
         method = meta.get('method', 'centroid')
@@ -618,7 +668,7 @@ def main():
             thresholds = {}
         else:
             # Standard Extrapolate Mode (Single method)
-            with open(args.meta) as f:
+            with open(args.meta[0]) as f:
                 meta = json.load(f)
             
             prediction_map_raw, aoi = get_prediction_image(meta, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year)
@@ -772,20 +822,11 @@ def main():
             # --- Run 10-fold Spatial CV for Ensemble ---
             if args.cv:
                 try:
-                    from autoSDM.trainer import run_parallel_cv
-                    
                     # Label input df (presence vs absence)
                     if 'type' not in df.columns:
                         df['type'] = df[class_prop].map({1: 'presence', 0: 'absence'}).fillna('background')
 
-                    sys.stderr.write("\nRunning 10-fold Spatial k-Means Cross-Validation for Ensemble...\n")
-                    sys.stderr.flush()
-                    cv_results = run_parallel_cv(
-                        df=df,
-                        ecological_vars=[f"A{i:02d}" for i in range(64)],
-                        scale=args.scale,
-                        n_folds=10
-                    )
+                    cv_results = get_cached_cv(args, df)
                     
                     # Export CV points CSV
                     if 'df' in cv_results:
@@ -799,7 +840,8 @@ def main():
                     sys.stderr.write("-" * 65 + "\n")
                     
                     csv_rows = []
-                    for i, fold_res in enumerate(cv_results['folds']):
+                    folds_list = cv_results.get('folds', [])
+                    for i, fold_res in enumerate(folds_list):
                         m = fold_res['ensemble']
                         cnt = fold_res['counts']
                         p_cnt = cnt.get('presence', 0)
@@ -819,15 +861,17 @@ def main():
                     sys.stderr.write("-" * 65 + "\n")
                     
                     # Report average (filtered for folds with presences)
-                    avg = cv_results['average']['ensemble']
-                    sys.stderr.write(f"{'AVG*':<6} | {'(val)':<6} | {'':<6} | {avg['cbi']:<10.3f} | {avg['auc_roc']:<10.3f} | {avg['auc_pr']:<10.3f}\n")
-                    sys.stderr.write("-" * 65 + "\n")
-                    sys.stderr.write("*Average excludes folds with 0 presence points.\n\n")
+                    avg = cv_results.get('average', {}).get('ensemble', {})
+                    if avg:
+                        sys.stderr.write(f"{'AVG*':<6} | {'(val)':<6} | {'':<6} | {avg.get('cbi', 0):<10.3f} | {avg.get('auc_roc', 0.5):<10.3f} | {avg.get('auc_pr', 0):<10.3f}\n")
+                        sys.stderr.write("-" * 65 + "\n")
+                        sys.stderr.write("*Average excludes folds with 0 presence points.\n\n")
 
                     # Export CV Metrics CSV
-                    cv_metrics_path = args.output.replace('.json', '_cv_metrics.csv') if args.output.endswith('.json') else args.output + "_cv_metrics.csv"
-                    pd.DataFrame(csv_rows).to_csv(cv_metrics_path, index=False)
-                    sys.stderr.write(f"CV metrics per fold saved to {cv_metrics_path}\n")
+                    if csv_rows:
+                        cv_metrics_path = args.output.replace('.json', '_cv_metrics.csv') if args.output.endswith('.json') else args.output + "_cv_metrics.csv"
+                        pd.DataFrame(csv_rows).to_csv(cv_metrics_path, index=False)
+                        sys.stderr.write(f"CV metrics per fold saved to {cv_metrics_path}\n")
                     
                     cv_res_data = {k: v for k, v in cv_results.items() if k != 'df'}
                 except Exception as e:

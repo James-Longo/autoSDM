@@ -16,7 +16,7 @@
 #' @param count Optional. Number of background points to generate. Defaults to 10x presence points (analyze) or 1000 (background).
 #' @return A list containing training data, models, and prediction results.
 #' @export
-autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_path = NULL, gee_project = NULL, cv = FALSE, predict_coords = NULL, methods = NULL, year = 2025, count = NULL) {
+autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_path = NULL, gee_project = NULL, cv = FALSE, predict_coords = NULL, methods = NULL, ensemble = TRUE, year = 2025, count = NULL) {
   # 1. Input Validation
   if (missing(data)) stop("Argument 'data' is required.")
 
@@ -64,20 +64,17 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
   has_absences <- "present" %in% names(data) && any(data$present == 0)
 
   if (is.null(methods)) {
-    methods <- if (has_absences) "ridge" else "centroid"
+    methods <- if (has_absences) c("ridge") else c("centroid")
   }
 
-  # Support "ensemble" as a method keyword
-  requested_ensemble <- "ensemble" %in% methods
-  if (requested_ensemble) {
-    # Remove "ensemble" from individual methods and ensure at least centroid/ridge
-    methods <- setdiff(methods, "ensemble")
-    methods <- unique(c(methods, "centroid", "ridge"))
+  # Ensure "ensemble" is not accidentally listed in methods list
+  methods <- setdiff(methods, "ensemble")
+
+  if (length(methods) == 0) {
+    stop("No valid matching methods found.")
   }
 
-  if (length(methods) > 1) {
-    requested_ensemble <- TRUE
-  }
+  # If more than one method is specified, ensemble is typically expected, but we respect the explicit argument.
 
   # 3. Python Configuration
   # Check for virtualenv and initialize dependencies
@@ -126,6 +123,11 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
   # Create output directory
   dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
 
+  # Temporary directory for inter-process CV cache (never written to output_dir)
+  cv_cache_dir <- tempfile(pattern = "autoSDM_cv_cache_")
+  dir.create(cv_cache_dir, showWarnings = FALSE)
+  cv_cache_arg <- c("--cv-cache-dir", shQuote(cv_cache_dir))
+
   # 5. Extract Embeddings (Satellite Data)
   # Step 1: Extracting Alpha Earth Embeddings (Once for all unique coordinates)
   message("--- Step 1: Extracting Alpha Earth Embeddings (Coordinate-Centric) ---")
@@ -159,7 +161,6 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
 
   if (!is_multi_species) {
     message("--- Single-Species Mode ---")
-    cv_arg <- if (cv) "--cv" else NULL
     proj_arg <- if (!is.null(gee_project)) c("--project", shQuote(gee_project)) else NULL
 
     meta_files <- list()
@@ -211,6 +212,14 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
 
       py_method <- m
 
+      # Determine if this step should trigger CV evaluation for this submodel
+      # If ensemble=TRUE, the submodels are just trained, CV evaluation happens at the end.
+      cv_arg_analyze <- if (cv && !ensemble) {
+        c("--cv", "--train-methods", m, "--eval-methods", m)
+      } else {
+        NULL
+      }
+
       system2(python_path, args = c(
         "-m", "autoSDM.cli", "analyze",
         "--input", shQuote(extract_csv),
@@ -219,15 +228,18 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
         "--scale", scale,
         "--year", year,
         if (!is.null(count)) c("--count", count) else NULL,
-        cv_arg, proj_arg, aoi_arg
+        cv_arg_analyze, cv_cache_arg, proj_arg, aoi_arg
       ))
 
       if (file.exists(out_json)) {
         meta_files[[m]] <- out_json
 
-        # 7. Generate Individual Map for this method
-        if (!is.null(aoi)) {
+        # 7. Generate Individual Map for this method (only when ensemble=FALSE)
+        # When ensemble=TRUE, submodel metadata is still needed for the ensemble step,
+        # but we skip the raster download — only the final ensemble map is output.
+        if (!is.null(aoi) && !ensemble) {
           message(sprintf("--- Step: Generating Individual Map (%s) ---", m))
+
           system2(python_path, args = c(
             "-m", "autoSDM.cli", "ensemble",
             "--input", shQuote(extract_csv),
@@ -236,7 +248,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
             "--scale", scale,
             "--prefix", m_clean,
             "--year", year,
-            cv_arg, proj_arg, aoi_arg
+            proj_arg, aoi_arg
           ))
         }
       }
@@ -280,8 +292,8 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
       }
     }
 
-    # 9. Generate Ensemble Map (if requested or multiple methods)
-    if (!is.null(aoi) && requested_ensemble) {
+    # 9. Generate Ensemble Map (if requested)
+    if (!is.null(aoi) && ensemble) {
       message("--- Step: Generating Ensemble Map (consensus of all methods) ---")
 
       ensemble_results_json <- file.path(output_dir, "ensemble_results.json")
@@ -300,7 +312,14 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
         ensemble_args <- c(ensemble_args, "--aoi-path", shQuote(aoi))
       }
 
-      if (!is.null(cv_arg)) ensemble_args <- c(ensemble_args, cv_arg)
+      # Run CV on ensemble formulation
+      cv_arg_ensemble <- if (cv) {
+        c("--cv", "--train-methods", paste(methods, collapse = ","), "--eval-methods", "ensemble")
+      } else {
+        NULL
+      }
+
+      if (!is.null(cv_arg_ensemble)) ensemble_args <- c(ensemble_args, cv_arg_ensemble, cv_cache_arg)
 
       status <- system2(python_path, args = ensemble_args)
       if (status != 0) stop("Ensemble extrapolation failed.")

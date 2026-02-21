@@ -247,83 +247,258 @@ def train_centroid_model(df, class_property='present', scale=10, aoi=None, year=
     
     return [centroid], metrics
 
-def run_cv_fold(fold_idx, df, ecological_vars, class_property, scale):
+def _dot_product_on_fc(fc, weights, emb_cols, label_col, intercept=0.0):
+    """
+    Compute server-side dot product scores on a pre-sampled FeatureCollection.
+
+    The FC already has embedding values as properties (from an earlier
+    sampleRegions call), so NO new sampleRegions is needed.  The dot product
+    expression is built client-side as a 64-step GEE graph and executed
+    entirely on GEE's servers.
+
+    Returns (sims, labels) as numpy arrays — only N scalar scores cross the wire.
+    """
     import ee
-    train_df = df[df['fold'] != fold_idx]
-    test_df = df[df['fold'] == fold_idx]
-    if test_df.empty: return None
 
-    from autoSDM.analyzer import analyze_embeddings, analyze_ridge
-    
+    # Build the dot-product GEE expression using the already-present embedding
+    # properties.  The Python loop constructs the expression graph client-side;
+    # evaluation happens server-side on the filtered FC.
+    intercept_num = ee.Number(float(intercept))
+
+    def add_score(feat):
+        sim = intercept_num
+        for col, w in zip(emb_cols, weights):
+            sim = sim.add(ee.Number(feat.get(col)).multiply(float(w)))
+        return feat.set('similarity', sim)
+
+    scored = fc.map(add_score).filter(ee.Filter.notNull(['similarity']))
+    r = scored.reduceColumns(
+        ee.Reducer.toList().repeat(2),
+        selectors=['similarity', label_col]
+    ).getInfo()
+    return (
+        np.array(r['list'][0], dtype=float),
+        np.array(r['list'][1], dtype=float),
+    )
+
+
+def run_cv_fold(fold_idx, all_sampled_fc, primary_img, emb_cols,
+                label_col_ridge, label_col_cent, fold_col, scale,
+                train_methods=None, eval_methods=None):
+    """
+    Evaluate a single CV fold using a pre-sampled FeatureCollection.
+
+    IMPORTANT: all_sampled_fc already contains GEE-side embedding values
+    (from the single sampleRegions call in run_parallel_cv).  No new
+    sampleRegions calls are made here.
+
+    Training uses server-side reduceColumns for centroid mean and
+    ridgeRegression.  Test scoring uses _dot_product_on_fc which maps
+    the dot-product expression directly over the test subset — again,
+    no sampleRegions, no embedding download.
+    """
+    import ee
+    train_methods = train_methods or ["centroid", "ridge"]
+    eval_methods = eval_methods or ["centroid", "ridge", "ensemble"]
+
+    train_fc = all_sampled_fc.filter(ee.Filter.neq(fold_col, fold_idx))
+    test_fc  = all_sampled_fc.filter(ee.Filter.eq(fold_col, fold_idx))
+
+    res_metrics = {}
+    c_sims, c_labels = None, None
+    r_sims, r_labels = None, None
+
+    # ------------------------------------------------------------------
     # 1. Centroid
-    c_res = analyze_embeddings(train_df, class_property=class_property)
-    t_emb = test_df[[f"A{i:02d}" for i in range(64)]].values
-    c_sim_matrix = np.dot(t_emb, np.array(c_res['centroids']).T)
-    c_sims = np.max(c_sim_matrix, axis=1)
-    c_metrics = calculate_classifier_metrics(c_sims[test_df[class_property] == 1], c_sims[test_df[class_property] == 0])
-    
-    # 2. Ridge
-    r_res = analyze_ridge(train_df, class_property=class_property)
-    r_weights = np.array(r_res['weights'])
-    r_intercept = r_res['intercept']
-    r_sims = np.dot(t_emb, r_weights) + r_intercept
-    r_metrics = calculate_classifier_metrics(r_sims[test_df[class_property] == 1], r_sims[test_df[class_property] == 0])
-    
-    # 3. Ensemble (Normalized Centroid * Normalized Ridge)
-    # We normalize both to 0-1 based on the min/max of the test set scores
-    # This prevents one method from dominating the product due to score scale.
-    def normalize(vals):
-        v_min, v_max = np.min(vals), np.max(vals)
-        if v_max - v_min == 0: return np.zeros_like(vals)
-        return (vals - v_min) / (v_max - v_min)
+    # ------------------------------------------------------------------
+    if 'centroid' in train_methods:
+        presence_train = train_fc.filter(ee.Filter.eq(label_col_cent, 1.0))
+        centroid_res   = presence_train.reduceColumns(
+            reducer=ee.Reducer.mean().repeat(len(emb_cols)),
+            selectors=emb_cols
+        ).getInfo()
+        centroid = centroid_res['mean']   # 64 numbers
+
+        # Score test fold
+        c_sims, c_labels = _dot_product_on_fc(test_fc, centroid, emb_cols, label_col_cent)
         
-    e_sims = normalize(c_sims) * normalize(r_sims)
-    e_sims = normalize(e_sims) # Final normalization of the ensemble product
-    e_metrics = calculate_classifier_metrics(e_sims[test_df[class_property] == 1], e_sims[test_df[class_property] == 0])
+        if 'centroid' in eval_methods:
+            res_metrics['centroid'] = calculate_classifier_metrics(
+                c_sims[c_labels == 1], c_sims[c_labels == 0]
+            )
 
-    # Calculate point counts for reporting
-    n_pos = int(np.sum(test_df[class_property] == 1))
-    n_neg = int(np.sum(test_df[class_property] == 0))
+    # ------------------------------------------------------------------
+    # 2. Ridge
+    # ------------------------------------------------------------------
+    if 'ridge' in train_methods:
+        reducer    = ee.Reducer.ridgeRegression(numX=len(emb_cols), numY=1, lambda_=0.1)
+        result     = train_fc.reduceColumns(
+            reducer=reducer,
+            selectors=emb_cols + [label_col_ridge]
+        )
+        coef_flat  = [row[0] for row in result.get('coefficients').getInfo()]
+        intercept  = coef_flat[0]      # row 0 is intercept (GEE convention)
+        weights    = coef_flat[1:]     # rows 1-64 are feature weights
 
-    return {
-        'centroid': c_metrics, 
-        'ridge': r_metrics, 
-        'ensemble': e_metrics,
-        'counts': {'presence': n_pos, 'background': n_neg}
-    }
+        # Score test fold
+        r_sims, r_labels = _dot_product_on_fc(
+            test_fc, weights, emb_cols, label_col_cent, intercept=intercept
+        )
+        
+        if 'ridge' in eval_methods:
+            res_metrics['ridge'] = calculate_classifier_metrics(
+                r_sims[r_labels == 1], r_sims[r_labels == 0]
+            )
 
-def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, n_folds=10):
+    # ------------------------------------------------------------------
+    # 3. Ensemble
+    # ------------------------------------------------------------------
+    if 'ensemble' in eval_methods and c_sims is not None and r_sims is not None:
+        def normalize(vals):
+            v_min, v_max = np.min(vals), np.max(vals)
+            if v_max - v_min == 0:
+                return np.zeros_like(vals)
+            return (vals - v_min) / (v_max - v_min)
+
+        n = min(len(c_sims), len(r_sims))
+        e_sims   = normalize(normalize(c_sims[:n]) * normalize(r_sims[:n]))
+        e_labels = c_labels[:n]
+        res_metrics['ensemble'] = calculate_classifier_metrics(
+            e_sims[e_labels == 1], e_sims[e_labels == 0]
+        )
+
+    # Calculate counts (assume test_fc size doesn't change regardless of method)
+    # Using the last evaluated label set for counts
+    eval_labels = c_labels if c_labels is not None else r_labels
+    if eval_labels is not None:
+        n_pos = int(np.sum(eval_labels == 1))
+        n_neg = int(np.sum(eval_labels == 0))
+    else:
+        n_pos, n_neg = 0, 0
+        
+    res_metrics['counts'] = {'presence': n_pos, 'background': n_neg}
+
+    return res_metrics
+
+
+def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, year=2025, n_folds=10, train_methods=None, eval_methods=None):
+    """
+    10-fold spatial cross-validation.
+
+    KEY ARCHITECTURE: embeddings are sampled from GEE exactly ONCE for all
+    training+test coordinates combined.  The resulting FeatureCollection
+    (with fold assignments and embedding properties) lives on the GEE server.
+    Each fold simply filters it server-side — no re-upload, no re-sampling.
+
+    Per fold:
+      - centroid: reduceColumns(mean)  on train subset  → 64 numbers
+      - ridge:    reduceColumns(ridge) on train subset  → 65 numbers
+      - scoring:  dot product mapped over test subset   → N scalars
+    Total sampleRegions calls: 1 (regardless of n_folds or n_methods).
+    """
+    import ee
+
     df_f = assign_spatial_folds(df, n_folds=n_folds)
-    
-    # Sequential execution is now much more stable for GEE and fast enough
-    # since we avoid re-sampling imagery if embeddings are already present.
+
+    ASSET_PATH      = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
+    EMB_COLS        = [f"A{i:02d}" for i in range(64)]
+    LABEL_RIDGE_COL = 'cv_ridge_label'   # +1 / -1  for ridgeRegression
+    LABEL_CENT_COL  = 'cv_cent_label'    # +1 /  0  for centroid / scoring
+    FOLD_COL        = 'cv_fold'
+    MP_CHUNK        = 5000
+
+    # Label encoding
+    df_f[LABEL_RIDGE_COL] = np.where(df_f[class_property] == 1,  1.0, -1.0)
+    df_f[LABEL_CENT_COL]  = np.where(df_f[class_property] == 1,  1.0,  0.0)
+    df_f[FOLD_COL]        = df_f['fold']
+
+    # Ensure year column
+    if 'year' not in df_f.columns:
+        df_f['year'] = year
+
+    # ------------------------------------------------------------------
+    # 1. Upload ALL coords + fold + labels as compact MultiPoint features
+    #    (grouped by year × ridge_label × fold → minimal GEE Features)
+    # ------------------------------------------------------------------
+    sys.stderr.write(
+        f"CV: uploading {len(df_f):,} coordinate pairs to GEE once "
+        f"(year × label × fold grouping) ...\n"
+    )
+    gee_features = []
+    for (yr, rl, fi), grp in df_f.groupby(['year', LABEL_RIDGE_COL, FOLD_COL]):
+        coords = grp[['longitude', 'latitude']].values.tolist()
+        cl = 1.0 if rl > 0 else 0.0
+        for i in range(0, len(coords), MP_CHUNK):
+            geom  = ee.Geometry.MultiPoint(coords[i : i + MP_CHUNK])
+            props = {
+                LABEL_RIDGE_COL: float(rl),
+                LABEL_CENT_COL:  float(cl),
+                FOLD_COL:        int(fi),
+            }
+            gee_features.append(ee.Feature(geom, props).set('year', int(yr)))
+
+    upload_fc = ee.FeatureCollection(gee_features)
+
+    # ------------------------------------------------------------------
+    # 2. Sample Alpha Earth embeddings ONCE for all coordinates
+    #    geometries=False is fine — after sampling, each point's embedding
+    #    is stored as properties on the FC features (server-side).
+    #    The FC is filtered per-fold without any re-uploading.
+    # ------------------------------------------------------------------
+    sys.stderr.write("CV: sampling Alpha Earth embeddings (once for all folds) ...\n")
+
+    all_years   = sorted(df_f['year'].unique())
+    sampled_fcs = []
+    for yr in all_years:
+        yr_fc  = upload_fc.filter(ee.Filter.eq('year', int(yr)))
+        yr_img = (
+            ee.ImageCollection(ASSET_PATH)
+            .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))
+            .mosaic()
+            .select(EMB_COLS)
+        )
+        sampled = yr_img.sampleRegions(
+            collection=yr_fc,
+            properties=[LABEL_RIDGE_COL, LABEL_CENT_COL, FOLD_COL],
+            scale=scale,
+            geometries=False   # no geometry needed; embeddings stored as props
+        ).filter(ee.Filter.notNull(['A00']))
+        sampled_fcs.append(sampled)
+
+    all_sampled_fc = ee.FeatureCollection(sampled_fcs).flatten()
+    sys.stderr.write("CV: embeddings sampled. Running fold evaluations ...\n")
+
+    # ------------------------------------------------------------------
+    # 3. Evaluate each fold using the shared server-side FC
+    # ------------------------------------------------------------------
+    sys.stderr.write(f"Spatial K-Means Folding ({n_folds} clusters):\n")
+    for fi in range(n_folds):
+        n_fi = len(df_f[df_f[FOLD_COL] == fi])
+        sys.stderr.write(f"  Fold {fi}: {n_fi} points\n")
+
     res = []
     for i in range(n_folds):
         sys.stderr.write(f"Processing 10-fold CV: Fold {i+1}/{n_folds}...\n")
-        fold_res = run_cv_fold(i, df_f, ecological_vars, class_property, scale)
+        fold_res = run_cv_fold(
+            i, all_sampled_fc, None,
+            EMB_COLS, LABEL_RIDGE_COL, LABEL_CENT_COL, FOLD_COL, scale,
+            train_methods=train_methods, eval_methods=eval_methods
+        )
         if fold_res:
             res.append(fold_res)
-    
+
     if not res:
         sys.stderr.write("Warning: All CV folds failed or returned no data.\n")
-        return {
-            'centroid': {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0},
-            'ridge': {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0},
-            'ensemble': {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0}
-        }
-    
+        return {m: {'cbi': 0.0, 'auc_roc': 0.5, 'auc_pr': 0.0} for m in (eval_methods or ["centroid", "ridge", "ensemble"])}
+
     avg = {}
-    for m in ['centroid', 'ridge', 'ensemble']:
-        # Filter for folds that have presences to avoid skewed averages (0.5 AUC / 0 CBI)
-        valid_folds = [r for r in res if r['counts']['presence'] > 0]
-        if not valid_folds:
-            # Fallback if no fold has presences (shouldn't happen with valid data)
-            valid_folds = res
-            
-        avg[m] = {
-            met: float(np.mean([r[m][met] for r in valid_folds])) 
-            for met in ['cbi', 'auc_roc', 'auc_pr']
-        }
+    for m in (eval_methods or ['centroid', 'ridge', 'ensemble']):
+        valid_folds = [r for r in res if r['counts']['presence'] > 0 and m in r] or [r for r in res if m in r]
+        if valid_folds:
+            avg[m] = {
+                met: float(np.mean([r[m][met] for r in valid_folds]))
+                for met in ['cbi', 'auc_roc', 'auc_pr']
+            }
     return {'average': avg, 'folds': res, 'df': df_f}
 
 def get_background_embeddings(aoi, n_points=1000, scale=100, year=2025):
