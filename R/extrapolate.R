@@ -13,7 +13,7 @@
 #' @param zip Logical. If TRUE, zips the output rasters into a single archive (local mode only).
 #' @return A list containing the paths to the generated map files, HTML, or GCS export details.
 #' @keywords internal
-extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10, coarse_meta_path = NULL, view = FALSE, gcs_bucket = NULL, wait = FALSE, zip = FALSE, python_path = NULL, gee_project = NULL) {
+extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = NULL, year = NULL, view = FALSE, gcs_bucket = NULL, wait = FALSE, zip = FALSE, python_path = NULL, gee_project = NULL) {
   # Resolve python path using the centralized helper
   py_exe <- resolve_python_path(python_path)
 
@@ -34,7 +34,8 @@ extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10
     "--input", shQuote(tmp_in),
     "--output", shQuote(output_json),
     "--meta", shQuote(analysis_meta_path),
-    "--scale", scale
+    "--scale", scale,
+    "--year", year
   )
 
   if (!is.null(gee_project) && gee_project != "") {
@@ -46,9 +47,6 @@ extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10
     args <- c(args, "--key", shQuote(sa_json_key))
   }
 
-  if (!is.null(coarse_meta_path)) {
-    args <- c(args, "--coarse-meta", shQuote(coarse_meta_path))
-  }
 
   if (view) {
     args <- c(args, "--view")
@@ -135,7 +133,7 @@ extrapolate <- function(df, analysis_meta_path, output_dir = getwd(), scale = 10
 #' @param coarse_meta_path Optional. Path to 1km coarse metadata for filtering.
 #' @return A data frame with original data plus a `similarity` column.
 #' @export
-predict_at_coords <- function(df, analysis_meta_path, scale = 10, python_path = NULL, gee_project = NULL, coarse_meta_path = NULL) {
+predict_at_coords <- function(df, analysis_meta_path, scale = NULL, year = NULL, python_path = NULL, gee_project = NULL) {
   py_exe <- resolve_python_path(python_path)
 
   if (is.null(py_exe) || !file.exists(py_exe)) {
@@ -151,11 +149,11 @@ predict_at_coords <- function(df, analysis_meta_path, scale = 10, python_path = 
     "--input", shQuote(tmp_in),
     "--output", shQuote(tmp_out),
     "--meta", shQuote(analysis_meta_path),
-    "--scale", scale
+    "--scale", scale,
+    "--year", year
   )
 
   if (!is.null(gee_project)) args <- c(args, "--project", shQuote(gee_project))
-  if (!is.null(coarse_meta_path)) args <- c(args, "--coarse-meta", shQuote(coarse_meta_path))
   if (exists("sa_json_key") && !is.null(sa_json_key)) args <- c(args, "--key", shQuote(sa_json_key))
 
   status <- system2(py_exe, args = args, stdout = "", stderr = "")

@@ -175,7 +175,7 @@ def _build_classifier(gee_name, params):
 
 
 def analyze_method(df, method, params=None, class_property="present",
-                   scale=10, year=None):
+                   scale=None, year=None):
     """
     Unified GEE train+score function for any supported method.
 
@@ -195,34 +195,14 @@ def analyze_method(df, method, params=None, class_property="present",
         method, params, metrics, similarity_range, similarities, clean_data
         + 'weights' and 'intercept' for reducer methods
     """
+    if scale is None:
+        raise ValueError("analyze_method: 'scale' (resolution in meters) must be explicitly provided.")
+    if year is None:
+        raise ValueError("analyze_method: 'year' must be explicitly provided.")
     import ee, sys
     params = params or {}
     EMB_COLS   = [f"A{i:02d}" for i in range(64)]
 
-    # ── 0. Local Fast-Path for 'mean' ─────────────────────────────────────
-    if method == "mean":
-        df_clean = df.dropna(subset=EMB_COLS + [class_property]).copy()
-        presence_embs = df_clean[df_clean[class_property] == 1][EMB_COLS].values
-        if len(presence_embs) == 0:
-            raise ValueError("No presence points found for local mean calculation.")
-
-        mean_vec = np.mean(presence_embs, axis=0)
-        similarities = np.dot(df_clean[EMB_COLS].values, mean_vec)
-        df_clean['similarity'] = similarities
-
-        pos_scores = df_clean[df_clean[class_property] == 1]['similarity'].values
-        neg_scores = df_clean[df_clean[class_property] == 0]['similarity'].values
-
-        return {
-            "method":           "mean",
-            "params":           {},
-            "weights":          mean_vec.tolist(),
-            "intercept":        0.0,
-            "metrics":          calculate_classifier_metrics(pos_scores, neg_scores),
-            "similarity_range": [float(np.min(similarities)), float(np.max(similarities))],
-            "similarities":     similarities.tolist(),
-            "clean_data":       df_clean,
-        }
 
     ASSET_PATH = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
     MP_CHUNK   = 5000
@@ -446,16 +426,30 @@ def analyze_method(df, method, params=None, class_property="present",
         else:
             raise ValueError(f"Unsupported reducer: {reducer_name}")
 
-        sys.stderr.write(f"{method}: received coefficients. Intercept = {intercept:.4f}\n")
+        # ── 5c. Score training data on GEE ────────────────────────────────────
+        sys.stderr.write(f"{method}: calculating similarity scores on GEE ...\n")
+        
+        # We calculate scores by mapping a dot product across the sampled collection
+        def score_feat(f):
+            # weights is a python list, intercept is a float
+            sim = ee.Number(intercept)
+            for i, col in enumerate(EMB_COLS):
+                sim = sim.add(ee.Number(f.get(col)).multiply(float(weights[i])))
+            return f.set('similarity', sim)
 
-        # Score training data locally using weight vector
-        X = df_clean[EMB_COLS].values.astype(float) if all(c in df_clean.columns for c in EMB_COLS) else None
-        if X is not None:
-            sims   = X @ np.array(weights) + intercept
-            labels = df_clean[class_property].values.astype(float)
-        else:
-            sims   = np.zeros(len(df_clean))
-            labels = df_clean[class_property].values.astype(float)
+        scored_fc = sampled_fc.map(score_feat)
+        
+        # Retrieve scores and labels
+        res = scored_fc.reduceColumns(
+            ee.Reducer.toList().repeat(5),
+            selectors=['similarity', LABEL_COL, "longitude", "latitude", "year"]
+        ).getInfo()
+        
+        sims   = np.array(res["list"][0], dtype=float)
+        labels = np.array(res["list"][1], dtype=float)
+        lons   = np.array(res["list"][2], dtype=float)
+        lats   = np.array(res["list"][3], dtype=float)
+        yrs    = np.array(res["list"][4], dtype=int)
 
     # ── 6. Compute metrics ────────────────────────────────────────────────
     pos_scores = sims[labels == 1]
@@ -466,19 +460,13 @@ def analyze_method(df, method, params=None, class_property="present",
         f"AUC-ROC={metrics.get('auc_roc', 0.5):.4f}\n"
     )
 
-    # ── 7. Build clean_data ───────────────────────────────────────────────
-    # Reconstruct from GEE response for classifiers (handles dropped points)
-    if is_classifier:
-        clean_data = pd.DataFrame({
-            class_property: (labels == 1).astype(int),
-            "longitude":    lons,
-            "latitude":     lats,
-            "year":         yrs,
-            "similarity":   sims,
-        })
-    else:
-        clean_data = df_clean.copy()
-        clean_data["similarity"] = sims
+    clean_data = pd.DataFrame({
+        class_property: (labels == 1).astype(int),
+        "longitude":    lons,
+        "latitude":     lats,
+        "year":         yrs,
+        "similarity":   sims,
+    })
 
 
     result_dict = {
@@ -496,11 +484,15 @@ def analyze_method(df, method, params=None, class_property="present",
     return result_dict
 
 
-def predict_method(train_df, test_df, method, params=None, class_property="present", scale=10, year=None):
+def predict_method(train_df, test_df, method, params=None, class_property="present", scale=None, year=None):
     """
     Train a model on train_df (coordinates only) and predict on test_df (coordinates + optional embeddings).
     This is used for accurate point predictions of GEE classifiers.
     """
+    if scale is None:
+        raise ValueError("predict_method: 'scale' (resolution in meters) must be explicitly provided.")
+    if year is None:
+        raise ValueError("predict_method: 'year' must be explicitly provided.")
     import ee, sys
     params = params or {}
     EMB_COLS   = [f"A{i:02d}" for i in range(64)]
@@ -527,11 +519,8 @@ def predict_method(train_df, test_df, method, params=None, class_property="prese
     test_df = test_df.copy()
     test_df['_point_id'] = np.arange(len(test_df))
 
-    train_has_embs = all([c in train_clean.columns for c in EMB_COLS])
-    test_has_embs = all([c in test_df.columns for c in EMB_COLS])
-
     # 2. Upload both to GEE
-    def df_to_fc(df, label_col=None, include_embs=False):
+    def df_to_fc(df, label_col=None):
         features = []
         for _, r in df.iterrows():
             geom = ee.Geometry.Point([r['longitude'], r['latitude']])
@@ -545,70 +534,92 @@ def predict_method(train_df, test_df, method, params=None, class_property="prese
             if '_point_id' in df.columns:
                 props['_point_id'] = int(r['_point_id'])
             if label_col: props[label_col] = float(r[label_col]) if is_reducer else int(r[label_col])
-            if include_embs:
-                for col in EMB_COLS:
-                    props[col] = float(r[col])
             features.append(ee.Feature(geom, props))
         return ee.FeatureCollection(features)
 
     # CHUNKED UPLOAD
-    def upload_large_fc(df, label_col=None, include_embs=False):
+    def upload_large_fc(df, label_col=None):
         chunks = []
         for i in range(0, len(df), 500):
             chunk = df.iloc[i:i+500]
-            chunks.append(df_to_fc(chunk, label_col, include_embs))
+            chunks.append(df_to_fc(chunk, label_col))
         return ee.FeatureCollection(chunks).flatten()
 
-    train_fc = upload_large_fc(train_clean, LABEL_COL, include_embs=train_has_embs)
-    test_fc  = upload_large_fc(test_df, include_embs=test_has_embs)
+    train_fc = upload_large_fc(train_clean, LABEL_COL)
+    test_fc  = upload_large_fc(test_df)
 
-    # 3. Sample Training Data on GEE (if needed)
-    if train_has_embs:
-        train_sampled = train_fc
-    else:
-        sys.stderr.write(f"predict_method({method}): sampling training embeddings on GEE...\n")
-        if 'year' in train_clean.columns:
-            sample_year = int(train_clean['year'].iloc[0])
-        elif year is not None:
-            sample_year = int(year)
-        else:
-            raise ValueError(f"predict_method({method}): 'year' must be provided either as a column or an argument.")
-        img = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL")\
-            .filter(ee.Filter.calendarRange(sample_year, sample_year, 'year'))\
+    # 3. Sample Training Data on GEE
+    sys.stderr.write(f"predict_method({method}): sampling training embeddings on GEE...\n")
+    years = sorted(train_clean["year"].unique()) if 'year' in train_clean.columns else [int(year)] if year is not None else None
+    if not years:
+        # Fallback if no year provided, use a default (though caller should have validated)
+        raise ValueError(f"predict_method({method}): 'year' must be provided for sampling.")
+    
+    sampled_fcs = []
+    for yr in years:
+        yr_fc  = train_fc.filter(ee.Filter.eq("year", int(yr)))
+        yr_img = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL")\
+            .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))\
             .mosaic().select(EMB_COLS)
-        train_sampled = img.sampleRegions(collection=train_fc, properties=[LABEL_COL], scale=scale, geometries=False, tileScale=16)
+        sampled_fcs.append(yr_img.sampleRegions(collection=yr_fc, properties=[LABEL_COL], scale=scale, geometries=False, tileScale=16))
+    train_sampled = ee.FeatureCollection(sampled_fcs).flatten()
 
-    # 4. Train
+    # 4. Sample Test Data on GEE
+    sys.stderr.write(f"predict_method({method}): sampling test embeddings on GEE...\n")
+    years = sorted(test_df["year"].unique()) if 'year' in test_df.columns else [int(year)] if year is not None else None
+    if not years:
+         raise ValueError(f"predict_method({method}): 'year' must be provided for sampling.")
+         
+    sampled_fcs = []
+    for yr in years:
+        yr_fc  = test_fc.filter(ee.Filter.eq("year", int(yr)))
+        yr_img = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL")\
+            .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))\
+            .mosaic().select(EMB_COLS)
+        sampled_fcs.append(yr_img.sampleRegions(collection=yr_fc, properties=['_point_id'], scale=scale, geometries=False, tileScale=16))
+    test_sampled = ee.FeatureCollection(sampled_fcs).flatten()
+
+    # 5. Train & Predict
     if is_classifier:
         clf = GEE_CLASSIFIER_METHODS[method](params)
         model = clf.train(features=train_sampled, classProperty=LABEL_COL, inputProperties=EMB_COLS)
+        
+        pred_col = "classification" if method != "maxent" else "probability"
+        results = test_sampled.classify(model).reduceColumns(ee.Reducer.toList(2), ["_point_id", pred_col]).getInfo()
     else:
+        # Reducer Path: Train (reduceColumns) and then Predict (map dot-product)
         reducer_name, _ = GEE_REDUCER_METHODS[method]
-        model = train_sampled.reduceColumns(
-            reducer=getattr(ee.Reducer, reducer_name)(numInputBands=64),
-            selectors=EMB_COLS + [LABEL_COL]
-        )
-        return None # Reducers handled locally
-
-    # 5. Classify Testing Data
-    if test_has_embs:
-        test_sampled = test_fc
-    else:
-        sys.stderr.write(f"predict_method({method}): classifying testing points on GEE...\n")
-        if 'year' in test_df.columns:
-            sample_year = int(test_df['year'].iloc[0])
-        elif year is not None:
-            sample_year = int(year)
+        
+        if reducer_name == "ridgeRegression":
+            reducer = ee.Reducer.ridgeRegression(numX=64, numY=1, lambda_=params.get("lambda_", 0.1))
+            res = train_sampled.reduceColumns(reducer=reducer, selectors=EMB_COLS + [LABEL_COL]).getInfo()
+            coefs = [float(row[0]) for row in res.get("coefficients")]
+            intercept, weights = coefs[0], coefs[1:]
+        elif reducer_name in ("linearRegression", "robustLinearRegression"):
+            train_fc_reg = train_sampled.map(lambda f: f.set("constant", 1.0))
+            factory = getattr(ee.Reducer, reducer_name)
+            reducer = factory(numX=65, numY=1)
+            res = train_fc_reg.reduceColumns(reducer=reducer, selectors=["constant"] + EMB_COLS + [LABEL_COL]).getInfo()
+            coefs = [float(row[0]) for row in res.get("coefficients")]
+            intercept, weights = coefs[0], coefs[1:]
+        elif reducer_name == "mean":
+            # Centroid
+            presence_fc = train_sampled.filter(ee.Filter.eq(LABEL_COL, 1))
+            centroid_res = presence_fc.reduceColumns(ee.Reducer.mean().repeat(64), selectors=EMB_COLS).getInfo()
+            weights = [float(w) for w in centroid_res["mean"]]
+            intercept = 0.0
         else:
-            raise ValueError(f"predict_method({method}): 'year' must be provided either as a column or an argument.")
-        img = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL")\
-            .filter(ee.Filter.calendarRange(sample_year, sample_year, 'year'))\
-            .mosaic().select(EMB_COLS)
-        test_sampled = img.sampleRegions(collection=test_fc, properties=['_point_id'], scale=scale, geometries=False, tileScale=16)
-    
-    pred_col = "classification" if method != "maxent" else "probability"
-    results = test_sampled.classify(model).reduceColumns(ee.Reducer.toList(2), ["_point_id", pred_col]).getInfo()
-    
+            raise ValueError(f"predict_method: Reducer {reducer_name} not supported for GEE prediction.")
+
+        # Map dot-product prediction over test data on GEE
+        def predict_feat(f):
+            score = ee.Number(intercept)
+            for i, col in enumerate(EMB_COLS):
+                score = score.add(ee.Number(f.get(col)).multiply(float(weights[i])))
+            return f.set('similarity', score)
+        
+        results = test_sampled.map(predict_feat).reduceColumns(ee.Reducer.toList(2), ["_point_id", "similarity"]).getInfo()
+
     # 6. Reconstruct predictions in same order
     out_dict = dict(results['list'])
     
@@ -624,6 +635,3 @@ def predict_method(train_df, test_df, method, params=None, class_property="prese
         sims.append(val)
 
     return np.array(sims)
-
-
-

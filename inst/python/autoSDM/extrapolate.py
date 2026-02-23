@@ -73,12 +73,14 @@ def merge_rasters(file_list, output_filename):
         for src in src_files:
             src.close()
 
-def generate_prediction_map(weights, df=None, coarse_filter=None, aoi=None, year=2025):
+def generate_prediction_map(weights, df=None, aoi=None, year=None):
     """
     Returns:
         image: ee.Image with similarity band.
         aoi: ee.Geometry.
     """
+    if year is None:
+        raise ValueError("generate_prediction_map: 'year' must be explicitly provided.")
     asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
     emb_cols = [f"A{i:02d}" for i in range(64)]
     
@@ -103,30 +105,27 @@ def generate_prediction_map(weights, df=None, coarse_filter=None, aoi=None, year
     # Calculate Dot Product (Cosine Similarity)
     dot_product = img.multiply(weights_img).reduce(ee.Reducer.sum()).rename('similarity')
     
-    # --- Coarse Filtering Logic ---
-    if coarse_filter:
-        sys.stderr.write("Applying coarse scale (1km) filter...\n")
-        coarse_weights_img = ee.Image.constant(list(coarse_filter['weights'])).rename(emb_cols)
-        coarse_dot = img.multiply(coarse_weights_img).reduce(ee.Reducer.sum())
-        coarse_mask = coarse_dot.gte(coarse_filter['threshold'])
-        dot_product = dot_product.updateMask(coarse_mask)
 
     return dot_product, aoi
 
 
 
 
-def get_prediction_image(meta, df=None, coarse_filter=None, aoi=None, year=2025, scale=10):
+def get_prediction_image(meta, df=None, aoi=None, year=None, scale=None):
     """
     Reconstructs an ee.Image prediction from metadata.
 
     For reducer methods (ridge, linear, robust_linear):
-        Uses stored weights/intercept — no re-training needed.
+        Uses stored weights/intercept - no re-training needed.
 
     For classifier methods (centroid, rf, gbt, cart, svm, maxent):
         Re-trains using training data from meta['training_csv'] (or `df`).
         All happens in the same GEE session; the classifier object never leaves.
     """
+    if year is None:
+        raise ValueError("get_prediction_image: 'year' must be explicitly provided.")
+    if scale is None:
+        raise ValueError("get_prediction_image: 'scale' must be explicitly provided.")
     import ee, sys
     from autoSDM.analyzer import GEE_CLASSIFIER_METHODS, GEE_REDUCER_METHODS
 

@@ -9,9 +9,9 @@ import os
 import sys
 import json
 import concurrent.futures
-from autoSDM.extractor import GEEExtractor
 from autoSDM.extrapolate import generate_prediction_map, download_mask, export_to_gcs, merge_rasters
 from shapely.geometry import mapping
+
 
 def get_cached_cv(args, df):
     """
@@ -82,7 +82,9 @@ def get_cached_cv(args, df):
     return cv_results
 
 
-def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df, year=2025):
+def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df, year=None):
+    if year is None:
+        raise ValueError("process_species_task: 'year' must be explicitly provided.")
     import ee
     try:
         sp_dir = os.path.join(output_dir, str(sp))
@@ -200,7 +202,7 @@ def run_multi_species_pipeline(args, df, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="autoSDM CLI")
-    parser.add_argument("mode", choices=["extract", "analyze", "extrapolate", "ensemble", "predict", "background"])
+    parser.add_argument("mode", choices=["analyze", "extrapolate", "ensemble", "predict", "background"])
     parser.add_argument("--input", required=False)
     parser.add_argument("--output", required=True)
     parser.add_argument("--key", help="Optional GEE service account key path. If not provided, uses existing session auth.")
@@ -208,8 +210,7 @@ def main():
     parser.add_argument("--aoi-path", help="Path to GeoJSON or Shapefile (polygon) for mapping extent.")
     parser.add_argument("--meta", action="append", help="Path to meta JSON(s) (for extrapolate/ensemble mode)")
     parser.add_argument("--meta2", help="DEPRECATED: Use multiple paths in --meta instead")
-    parser.add_argument("--coarse-meta", help="Path to coarse meta JSON (for filtering 10m output)")
-    parser.add_argument("--scale", type=int, default=10, help="Scale in meters (default: 10)")
+    parser.add_argument("--scale", type=int, help="Scale in meters (e.g. 10 or 100). Required.")
     parser.add_argument("--view", action="store_true", help="Generate a web map for visualization instead of downloading GeoTIFFs.")
     parser.add_argument("--gcs-bucket", help="GCS bucket name for server-side export (bypasses local download)")
     parser.add_argument("--wait", action="store_true", help="Wait for the export task(s) to complete and show progress updates.")
@@ -233,25 +234,13 @@ def main():
     parser.add_argument("--train-methods", help="Comma-separated list of methods to train during CV (e.g., 'centroid,ridge')")
     parser.add_argument("--eval-methods", help="Comma-separated list of methods to evaluate during CV (e.g., 'ensemble')")
     parser.add_argument("--cv-cache-dir", help="Directory for the inter-process CV cache file (default: system tempdir). Set to R's tempdir() to keep output folders clean.")
-    parser.add_argument("--year", type=int, default=2025, help="Alpha Earth Mosaic year for mapping (default: 2025)")
+    parser.add_argument("--year", type=int, help="Alpha Earth Mosaic year for mapping (2017-2025). Required.")
     
     args = parser.parse_args()
     sys.stderr.write(f"DEBUG: autoSDM CLI starting. Mode={args.mode}, Input={args.input}\n")
     sys.stderr.flush()
     
-    if args.mode == "extract":
-        # Coordinate-Centric Extraction 
-        df = pd.read_csv(args.input)
-        extractor = GEEExtractor(args.key, project=args.project)
-        res = extractor.extract_embeddings(
-            df, 
-            scale=args.scale
-        )
-        os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-        res.to_csv(args.output, index=False)
-        sys.stderr.write(f"Extraction complete at {args.scale}m. Results saved to {args.output}\n")
-        
-    elif args.mode == "background":
+    if args.mode == "background":
         # Background Sampling Mode
         import ee
         try: ee.Initialize(project=args.project) if args.project else ee.Initialize()
@@ -367,9 +356,7 @@ def main():
 
         # Classifier methods: store CSV path so get_prediction_image() can reload
         # the full training data (with lat/lon + both classes) at map time
-        from autoSDM.analyzer import GEE_CLASSIFIER_METHODS as _CLF_METHODS
-        if method in _CLF_METHODS:
-            meta['training_csv'] = os.path.abspath(args.output)
+        meta['training_csv'] = os.path.abspath(args.output)
 
         if args.cv:
             cv_results = get_cached_cv(args, df)
@@ -390,23 +377,9 @@ def main():
         # Point Prediction Mode
         df = pd.read_csv(args.input)
         
-        # Check if embeddings are already present
-        emb_cols = [f"A{i:02d}" for i in range(64)]
-        has_embeddings = all(col in df.columns for col in emb_cols)
-        
-        if has_embeddings:
-            sys.stderr.write("Using existing embeddings from input CSV.\n")
-            df_emb = df
-            # Still need to initialize GEE for classifier-based predictions
-            extractor = GEEExtractor(args.key, project=args.project)
-        else:
-            # 1. Extract Embeddings for these specific points
-            extractor = GEEExtractor(args.key, project=args.project)
-            df_emb = extractor.extract_embeddings(df, scale=args.scale)
-        
-        if df_emb.empty:
-            sys.stderr.write("Error: Point extraction returned no data or input was empty.\n")
-            sys.exit(1)
+        import ee
+        try: ee.Initialize(project=args.project) if args.project else ee.Initialize()
+        except: pass
             
         # 2. Load Metadata
         with open(args.meta[0]) as f:
@@ -414,53 +387,24 @@ def main():
         
         method = meta.get('method', 'centroid')
         
-        # 3. Optional Coarse Filter
-        if args.coarse_meta:
-            with open(args.coarse_meta) as f:
-                coarse_meta = json.load(f)
-            
-            # Extract coarse embeddings for filtering
-            df_coarse = extractor.extract_embeddings(df, scale=1000)
-            if not df_coarse.empty:
-                coarse_emb_cols = [f"A{i:02d}" for i in range(64)]
-                # Unified linear prediction (Centroid, Ridge, Linear, etc.)
-                c_weights = np.array(coarse_meta['weights'])
-                c_intercept = coarse_meta.get('intercept', 0.0)
-                coarse_sims = np.dot(df_coarse[coarse_emb_cols].values, c_weights) + c_intercept
-                    
-                # Filter df_emb based on coarse threshold
-                valid_mask = coarse_sims >= coarse_meta.get('threshold_5pct', -1)
-                df_emb = df_emb[valid_mask].copy()
-                sys.stderr.write(f"Coarse filter dropped {np.sum(~valid_mask)} points.\n")
-
-        emb_cols = [f"A{i:02d}" for i in range(64)]
-        
-        # 4. Point Prediction
-        if method in ("centroid", "mean", "ridge", "linear", "robust_linear"):
-            weights   = np.array(meta['weights'])
-            intercept = meta.get('intercept', 0.0)
-            df_emb['similarity'] = np.dot(df_emb[emb_cols].values, weights) + intercept
+        # 4. Point Prediction (Always on GEE)
+        training_csv = meta.get('training_csv')
+        if training_csv and os.path.exists(training_csv):
+            sys.stderr.write(f"Predicting {method} similarities on GEE...\n")
+            df_train = pd.read_csv(training_csv)
+            from autoSDM.analyzer import predict_method
+            sims = predict_method(df_train, df, method, params=meta.get('params'), scale=args.scale, year=args.year)
+            df['similarity'] = sims
         else:
-            # GEE Classifier Path (RF, GBT, SVM, MaxEnt)
-            training_csv = meta.get('training_csv')
-            if training_csv and os.path.exists(training_csv):
-                sys.stderr.write(f"Loading training data for GEE-based prediction from: {training_csv}\n")
-                df_train = pd.read_csv(training_csv)
-                from autoSDM.analyzer import predict_method
-                sims = predict_method(df_train, df_emb, method, params=meta.get('params'), scale=args.scale, year=args.year)
-                if sims is not None:
-                    df_emb['similarity'] = sims
-            else:
-                sys.stderr.write(f"Warning: No training_csv found for {method}. Defaulting to similarity=0.\n")
-                if 'similarity' not in df_emb.columns:
-                     df_emb['similarity'] = 0.0
+            sys.stderr.write(f"Warning: No training_csv found for {method}. Similarity scores will be NaN.\n")
+            df['similarity'] = np.nan
             
 
 
 
         # 5. Save Results
         os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-        df_emb.to_csv(args.output, index=False)
+        df.to_csv(args.output, index=False)
         sys.stderr.write(f"Point predictions complete. Results saved to {args.output}\n")
 
     elif args.mode == "extrapolate" or args.mode == "ensemble":
@@ -482,35 +426,12 @@ def main():
             else:
                  df['year'] = args.year
 
-        # Check for embeddings
-        emb_cols = [f"A{i:02d}" for i in range(64)]
-        
-        # If they are lowercase, rename to uppercase to satisfy analyzer/trainer
-        if all(col.lower() in df.columns for col in emb_cols):
-             df = df.rename(columns={col.lower(): col for col in emb_cols})
-             
-        has_embeddings = all(col in df.columns for col in emb_cols)
-        
-        extractor = GEEExtractor(args.key, project=args.project) # Initialize GEE
-        if not has_embeddings:
-            sys.stderr.write("Environmental embeddings (A00-A63) missing. Extracting from GEE for CV and metrics...\n")
-            df = extractor.extract_embeddings(df, scale=args.scale)
-            if df.empty:
-                sys.stderr.write("Error: Failed to extract embeddings.\n")
-                sys.exit(1)
+        import ee
+        try: ee.Initialize(project=args.project) if args.project else ee.Initialize()
+        except: pass
 
         from autoSDM.extrapolate import get_prediction_image
 
-        
-        # Load Coarse Meta for Filtering (Optional)
-        coarse_filter = None
-        if args.coarse_meta:
-            with open(args.coarse_meta) as f:
-                coarse_meta = json.load(f)
-            coarse_filter = {
-                'centroid': coarse_meta['centroid'],
-                'threshold': coarse_meta['threshold_5pct'] # Use 5pct of coarse for filtering
-            }
         
         # Determine AOI if lat/lon/radius are provided
         import ee
@@ -540,24 +461,13 @@ def main():
             sys.stderr.write(f"Ensemble mode: Loading {len(meta_paths)} meta files: {meta_paths}\n")
             
             prediction_map = None
-            for i, mp in enumerate(meta_paths):
-                sys.stderr.write(f"Processing meta file {i+1}/{len(meta_paths)}: {mp}\n")
-                with open(mp) as f:
-                    mdata = json.load(f)
-                
-                img_i, aoi_i = get_prediction_image(mdata, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year, scale=args.scale)
-                if aoi is None: aoi = aoi_i
-                
-                # Normalize based on similarity_range from training metadata
-                s_range = mdata.get('similarity_range', [0.0, 1.0])
-                # Debugging: ensures we know why a default might be used
             ensemble_images = []
             for i, mp in enumerate(meta_paths):
                 sys.stderr.write(f"Processing meta file {i+1}/{len(meta_paths)}: {mp}\n")
                 with open(mp) as f:
                     mdata = json.load(f)
                 
-                img_i, aoi_i = get_prediction_image(mdata, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year, scale=args.scale)
+                img_i, aoi_i = get_prediction_image(mdata, df, aoi=aoi, year=args.year, scale=args.scale)
                 if aoi is None: aoi = aoi_i
                 
                 # Normalize based on similarity_range from training metadata
@@ -584,7 +494,7 @@ def main():
             with open(args.meta[0]) as f:
                 meta = json.load(f)
             
-            prediction_map_raw, aoi = get_prediction_image(meta, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year, scale=args.scale)
+            prediction_map_raw, aoi = get_prediction_image(meta, df, aoi=aoi, year=args.year, scale=args.scale)
             
             # Normalize single map if range exists
             s_range = meta.get('similarity_range', [0.0, 1.0])
@@ -829,23 +739,6 @@ def main():
 
             layers = []
             
-            # 0. Coarse Filter Layer (Debug)
-            if coarse_filter:
-                # Re-create the coarse mask image for visualization
-                # We need to replicate the logic inside generate_prediction_map or assume it works
-                # Let's just visualize the one used inside if we can access it? 
-                # We can't easily access internal variables of the function.
-                # Let's recreate it here for the map.
-                yr = 2025
-                img = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL").filter(ee.Filter.calendarRange(yr, yr, 'year')).mosaic()
-                coarse_centroid_img = ee.Image.constant(list(coarse_filter['centroid']))
-                # Use native projection logic same as interpolate.py
-                first_img = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL").filter(ee.Filter.calendarRange(yr, yr, 'year')).first()
-                native_proj = first_img.projection()
-                
-                coarse_dot = img.multiply(coarse_centroid_img).reduce(ee.Reducer.sum())
-                coarse_mask_viz = coarse_dot.reproject(crs=native_proj, scale=1000).gte(coarse_filter['threshold'])
-                layers.append(get_layer_config(coarse_mask_viz.selfMask(), {'palette': ['orange']}, "Coarse Mask (1km)"))
 
             # 1. Similarity Layer
             sim_viz = {'min': 0, 'max': 1, 'palette': ['000000', '0000FF', '00FF00', 'FFFF00', 'FF0000']}

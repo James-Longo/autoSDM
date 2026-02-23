@@ -23,9 +23,9 @@
 #' @param lambda_ Optional. Regularisation strength for ridge/linear reducers. Defaults to 0.1.
 #' @return A list containing training data, models, and prediction results.
 #' @export
-autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_path = NULL,
+autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = NULL, python_path = NULL,
                     gee_project = NULL, cv = FALSE, predict_coords = NULL,
-                    methods = NULL, ensemble = TRUE, year = 2025, count = NULL,
+                    methods = NULL, ensemble = TRUE, year = NULL, count = NULL,
                     n_trees = 100L, svm_kernel = "RBF", lambda_ = 0.1) {
   # 1. Input Validation
   if (missing(data)) stop("Argument 'data' is required.")
@@ -138,18 +138,11 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
   dir.create(cv_cache_dir, showWarnings = FALSE)
   cv_cache_arg <- c("--cv-cache-dir", shQuote(cv_cache_dir))
 
-  # 5. Extract Embeddings (Satellite Data)
-  # Step 1: Extracting Alpha Earth Embeddings (Once for all unique coordinates)
-  message("--- Step 1: Extracting Alpha Earth Embeddings (Coordinate-Centric) ---")
-  embedded_data <- extract_embeddings(
-    data,
-    scale = scale,
-    python_path = python_path,
-    gee_project = gee_project
-  )
+  # 5. Decide on Multi-Species
+  is_multi_species <- "species" %in% names(data) && length(unique(data$species)) > 1
 
-  # 4. Decide on Multi-Species
-  is_multi_species <- "species" %in% names(embedded_data) && length(unique(embedded_data$species)) > 1
+  # Use the raw input data as our base; analyze/predict CLI will sample GEE as needed.
+  working_data <- data
 
   # 5. Prepare AOI arguments
   aoi_arg <- NULL
@@ -162,11 +155,11 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
   # 6. Extraction/Preparation
   # (Standardizing CSV output for Python)
   extract_csv <- tempfile(fileext = ".csv")
-  # embedded_data is already extracted from step 5
+  # working_data is our raw input (coords only)
   if (requireNamespace("vroom", quietly = TRUE)) {
-    vroom::vroom_write(embedded_data, extract_csv, delim = ",")
+    vroom::vroom_write(working_data, extract_csv, delim = ",")
   } else {
-    write.csv(embedded_data, extract_csv, row.names = FALSE)
+    write.csv(working_data, extract_csv, row.names = FALSE)
   }
 
   if (!is_multi_species) {
@@ -178,12 +171,12 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
     # Shared Background logic for Presence-Only
     # If any model needs background (centroid/ridge) and we don't have absences yet.
     needs_bg <- any(methods %in% c("centroid", "ridge")) &&
-      !("present" %in% names(embedded_data) && any(embedded_data$present == 0))
+      !("present" %in% names(working_data) && any(working_data$present == 0))
 
     if (needs_bg && (!is.null(aoi) || !is.null(aoi_arg))) {
       message("--- Step: Generating Shared Background Points (10:1) ---")
       bg_csv <- tempfile(fileext = ".csv")
-      n_bg <- nrow(embedded_data) * 10
+      n_bg <- nrow(working_data) * 10
 
       system2(python_path, args = c(
         "-m", "autoSDM.cli", "background",
@@ -197,17 +190,17 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
       if (file.exists(bg_csv)) {
         bg_data <- read.csv(bg_csv)
         if (!"present" %in% names(bg_data)) bg_data$present <- 0
-        if (!"present" %in% names(embedded_data)) embedded_data$present <- 1
+        if (!"present" %in% names(working_data)) working_data$present <- 1
 
         # Ensure column alignment
-        common_cols <- intersect(names(embedded_data), names(bg_data))
-        embedded_data <- rbind(embedded_data[, common_cols], bg_data[, common_cols])
+        common_cols <- intersect(names(working_data), names(bg_data))
+        working_data <- rbind(working_data[, common_cols], bg_data[, common_cols])
 
         # Update standardized CSV with background points
         if (requireNamespace("vroom", quietly = TRUE)) {
-          vroom::vroom_write(embedded_data, extract_csv, delim = ",")
+          vroom::vroom_write(working_data, extract_csv, delim = ",")
         } else {
-          write.csv(embedded_data, extract_csv, row.names = FALSE)
+          write.csv(working_data, extract_csv, row.names = FALSE)
         }
       }
     }
@@ -215,8 +208,12 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
     # Track execution time for each method
     execution_times <- list()
 
-    # Loop through requested methods
-    for (m in methods) {
+    # Use parallel::mclapply for concurrency on Unix platforms
+    cores_to_use <- if (.Platform$OS.type == "unix") length(methods) else 1
+
+    message(sprintf("--- Dispatching %d Method(s) in Parallel ---", length(methods)))
+
+    parallel_results <- parallel::mclapply(methods, function(m) {
       m_clean <- gsub("[^a-zA-Z0-9]", "", m)
       message(sprintf("--- Step: Running %s Analysis ---", m))
 
@@ -240,6 +237,8 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
         if (m %in% c("ridge", "linear", "robust_linear")) c("--lambda", as.character(lambda_))
       )
 
+      ret <- list(method = m, meta_file = NULL, training_seconds = NA)
+
       start_time <- Sys.time()
       system2(python_path, args = c(
         "-m", "autoSDM.cli", "analyze",
@@ -253,11 +252,10 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
       ))
       end_time <- Sys.time()
 
-      if (is.null(execution_times[[m]])) execution_times[[m]] <- list()
-      execution_times[[m]]$training_seconds <- as.numeric(difftime(end_time, start_time, units = "secs"))
+      ret$training_seconds <- as.numeric(difftime(end_time, start_time, units = "secs"))
 
       if (file.exists(out_json)) {
-        meta_files[[m]] <- out_json
+        ret$meta_file <- out_json
 
         # 7. Generate Individual Map for this method (only when ensemble=FALSE)
         # When ensemble=TRUE, submodel metadata is still needed for the ensemble step,
@@ -277,40 +275,57 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
           ))
         }
       }
+      return(ret)
+    }, mc.cores = cores_to_use)
+
+    # Reconstruct meta_files and execution_times
+    for (res in parallel_results) {
+      if (!is.null(res$meta_file)) meta_files[[res$method]] <- res$meta_file
+      if (is.null(execution_times[[res$method]])) execution_times[[res$method]] <- list()
+      execution_times[[res$method]]$training_seconds <- res$training_seconds
     }
 
     # 8. Predict at specific coordinates (if provided)
     if (!is.null(predict_coords)) {
-      message("--- Step: Predicting at specific coordinates ---")
-      pred_embedded <- extract_embeddings(predict_coords, scale = scale, python_path = python_path, gee_project = gee_project)
-      point_preds <- pred_embedded
+      message("--- Step: Predicting at specific coordinates (Parallel) ---")
 
-      # Combined product similarity
+      pred_results <- parallel::mclapply(methods, function(m) {
+        meta_p <- file.path(output_dir, paste0(m, ".json"))
+        if (!file.exists(meta_p)) {
+          return(NULL)
+        }
+
+        m_meta <- jsonlite::fromJSON(meta_p)
+        s_range <- m_meta$similarity_range
+
+        pred_start_time <- Sys.time()
+        preds <- predict_at_coords(predict_coords, analysis_meta_path = meta_p, scale = scale, year = year, python_path = python_path, gee_project = gee_project)
+        pred_end_time <- Sys.time()
+
+        if (!is.null(s_range) && (s_range[2] - s_range[1] > 1e-9)) {
+          norm_sim <- (preds$similarity - s_range[1]) / (s_range[2] - s_range[1])
+        } else {
+          norm_sim <- preds$similarity
+        }
+
+        return(list(
+          method = m,
+          norm_sim = norm_sim,
+          prediction_seconds = as.numeric(difftime(pred_end_time, pred_start_time, units = "secs"))
+        ))
+      }, mc.cores = cores_to_use)
+
+      point_preds <- predict_coords
       point_preds$similarity <- 1.0
 
-      for (m in methods) {
-        meta_p <- file.path(output_dir, paste0(m, ".json"))
-        if (file.exists(meta_p)) {
-          # Read metadata to get normalization range
-          m_meta <- jsonlite::fromJSON(meta_p)
-          s_range <- m_meta$similarity_range
-
-          pred_start_time <- Sys.time()
-          preds <- predict_at_coords(pred_embedded, analysis_meta_path = meta_p, scale = scale, python_path = python_path, gee_project = gee_project)
-          pred_end_time <- Sys.time()
+      for (res in pred_results) {
+        if (!is.null(res)) {
+          m <- res$method
+          point_preds[[m]] <- res$norm_sim
+          point_preds$similarity <- point_preds$similarity * res$norm_sim
 
           if (is.null(execution_times[[m]])) execution_times[[m]] <- list()
-          execution_times[[m]]$prediction_seconds <- as.numeric(difftime(pred_end_time, pred_start_time, units = "secs"))
-
-          # Normalize to 0-1
-          if (!is.null(s_range) && (s_range[2] - s_range[1] > 1e-9)) {
-            norm_sim <- (preds$similarity - s_range[1]) / (s_range[2] - s_range[1])
-          } else {
-            norm_sim <- preds$similarity
-          }
-
-          point_preds[[m]] <- norm_sim
-          point_preds$similarity <- point_preds$similarity * norm_sim
+          execution_times[[m]]$prediction_seconds <- res$prediction_seconds
         }
       }
 
@@ -371,7 +386,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
   } else {
     # MULTI-SPECIES WORKFLOW
     # -------------------------------------------------------------------------
-    message(sprintf("--- Multi-Species Mode: Processing %d species ---", length(unique(embedded_data$species))))
+    message(sprintf("--- Multi-Species Mode: Processing %d species ---", length(unique(working_data$species))))
     message("Orchestrating GEE server-side parallelization...")
 
 
@@ -404,7 +419,7 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
     if (status != 0) stop("Multi-species analysis failed.")
 
     # Load and combine results from species-specific directories
-    species_list <- unique(embedded_data$species)
+    species_list <- unique(working_data$species)
     results_list <- list()
     for (sp in species_list) {
       res_path <- file.path(output_dir, sp, "results.json")

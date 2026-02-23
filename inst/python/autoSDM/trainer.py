@@ -8,31 +8,65 @@ from autoSDM.analyzer import calculate_classifier_metrics
 
 def assign_spatial_folds(df, n_folds=10, grid_size=None):
     """
-    Assigns fold IDs based on spatial k-means clustering of points.
+    Assigns fold IDs based on spatial k-means clustering of points on Google Earth Engine.
     """
-    from sklearn.cluster import KMeans
     df = df.copy()
+    if len(df) <= n_folds:
+        df['fold'] = np.arange(len(df)) % n_folds
+        return df
+
+    sys.stderr.write(f"Assigning {n_folds} spatial folds on GEE using wekaKMeans...\n")
     
-    # Use spatial coordinates for clustering
-    coords = df[['latitude', 'longitude']].values
+    # 1. Upload coordinates to GEE with a temporary ID for re-joining
+    df['_tmp_id'] = np.arange(len(df))
     
-    # Deterministic K-Means clustering
-    kmeans = KMeans(n_clusters=n_folds, random_state=42, n_init=10)
-    df['fold'] = kmeans.fit_predict(coords)
+    features = []
+    # Using a slightly more efficient feature creation
+    for _, row in df.iterrows():
+        geom = ee.Geometry.Point([float(row['longitude']), float(row['latitude'])])
+        features.append(ee.Feature(geom, {
+            '_tmp_id': int(row['_tmp_id']), 
+            'lat': float(row['latitude']), 
+            'lon': float(row['longitude'])
+        }))
+    
+    # Chunk upload to stay under GEE limits if large
+    chunk_size = 5000
+    fc_chunks = []
+    for i in range(0, len(features), chunk_size):
+        fc_chunks.append(ee.FeatureCollection(features[i:i+chunk_size]))
+    fc = ee.FeatureCollection(fc_chunks).flatten()
+    
+    # 2. Train and apply the Clusterer
+    # We cluster on coordinates (lat/lon)
+    clusterer = ee.Clusterer.wekaKMeans(n_folds).train(fc, ['lat', 'lon'])
+    clustered = fc.cluster(clusterer, 'fold')
+    
+    # 3. Retrieve results back to local environment
+    cl_res = clustered.reduceColumns(ee.Reducer.toList(2), ['_tmp_id', 'fold']).getInfo()
+    
+    # 4. Re-join fold assignments back to original dataframe
+    fold_map = {int(pair[0]): int(pair[1]) for pair in cl_res['list']}
+    df['fold'] = df['_tmp_id'].map(fold_map)
+    
+    # Drop temp columns
+    df.drop(columns=['_tmp_id'], inplace=True)
     
     # Report cluster sizes
     counts = df['fold'].value_counts().sort_index()
-    sys.stderr.write(f"Spatial K-Means Folding ({n_folds} clusters):\n")
+    sys.stderr.write(f"GEE Spatial K-Means Folding Complete ({n_folds} clusters):\n")
     for fold, count in counts.items():
         sys.stderr.write(f"  Fold {fold}: {count} points\n")
         
     return df
 
 
-def _prepare_training_data(df, ecological_vars, class_property='present', scale=10):
+def _prepare_training_data(df, ecological_vars, class_property='present', scale=None):
     """
     Shared logic for cleaning and sanitizing training data.
     """
+    if scale is None:
+        raise ValueError("_prepare_training_data: 'scale' must be explicitly provided.")
     # 1. Class Property Detection (Skip if Discovery Mode)
     if class_property is not None:
         if class_property not in df.columns:
@@ -180,12 +214,16 @@ def get_safe_scores_and_labels(clf, fc, class_property, name="Model"):
 
 
 
-def train_centroid_model(df, class_property='present', scale=10, aoi=None, year=2025):
+def train_centroid_model(df, class_property='present', scale=None, aoi=None, year=None):
     """
-    Calculates the species centroid based on embeddings.
+    Simpler Centroid-only path for quick benchmarks.
     If no absences are provided (Presence-Only), it samples background points from GEE
     to provide accuracy metrics (AUC, Boyce Index, etc.)
     """
+    if scale is None:
+        raise ValueError("train_centroid_model: 'scale' must be explicitly provided.")
+    if year is None:
+        raise ValueError("train_centroid_model: 'year' must be explicitly provided.")
     from autoSDM.analyzer import calculate_classifier_metrics
 
     # 1. Prepare and Sample Training Data
@@ -404,19 +442,24 @@ def run_cv_fold(fold_idx, all_sampled_fc, primary_img, emb_cols,
 
 
 
-def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, year=2025, n_folds=10, train_methods=None, eval_methods=None):
+def run_parallel_cv(df, ecological_vars, class_property='present', scale=None, year=None, n_folds=10, train_methods=None, eval_methods=None):
     """
     10-fold spatial cross-validation.
-
+    """
+    if scale is None:
+        raise ValueError("run_parallel_cv: 'scale' must be explicitly provided.")
+    if year is None:
+        raise ValueError("run_parallel_cv: 'year' must be explicitly provided.")
+    """
     KEY ARCHITECTURE: embeddings are sampled from GEE exactly ONCE for all
     training+test coordinates combined.  The resulting FeatureCollection
     (with fold assignments and embedding properties) lives on the GEE server.
-    Each fold simply filters it server-side — no re-upload, no re-sampling.
+    Each fold simply filters it server-side - no re-upload, no re-sampling.
 
     Per fold:
-      - centroid: reduceColumns(mean)  on train subset  → 64 numbers
-      - ridge:    reduceColumns(ridge) on train subset  → 65 numbers
-      - scoring:  dot product mapped over test subset   → N scalars
+      - centroid: reduceColumns(mean)  on train subset  -> 64 numbers
+      - ridge:    reduceColumns(ridge) on train subset  -> 65 numbers
+      - scoring:  dot product mapped over test subset   -> N scalars
     Total sampleRegions calls: 1 (regardless of n_folds or n_methods).
     """
     import ee
@@ -526,7 +569,7 @@ def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, yea
             }
     return {'average': avg, 'folds': res, 'df': df_f}
 
-def get_background_embeddings(aoi, n_points=1000, scale=100, year=2025):
+def get_background_embeddings(aoi, n_points=1000, scale=None, year=None):
     """
     Samples random background points in GEE and extracts their Alpha Earth embeddings.
     Uses image.sample() to ensure points fall on valid data pixels ("intrinsic mask").
