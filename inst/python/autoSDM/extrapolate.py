@@ -73,7 +73,7 @@ def merge_rasters(file_list, output_filename):
         for src in src_files:
             src.close()
 
-def generate_prediction_map(centroid, df=None, coarse_filter=None, aoi=None, year=2025):
+def generate_prediction_map(weights, df=None, coarse_filter=None, aoi=None, year=2025):
     """
     Returns:
         image: ee.Image with similarity band.
@@ -97,17 +97,17 @@ def generate_prediction_map(centroid, df=None, coarse_filter=None, aoi=None, yea
         min_lon, max_lon = df['longitude'].min(), df['longitude'].max()
         aoi = ee.Geometry.Rectangle([min_lon - 0.01, min_lat - 0.01, max_lon + 0.01, max_lat + 0.01])
     
-    # Create centroid constant image with matching band names for clean multiplication
-    centroid_img = ee.Image.constant(list(centroid)).rename(emb_cols)
+    # Create weights constant image with matching band names for clean multiplication
+    weights_img = ee.Image.constant(list(weights)).rename(emb_cols)
     
     # Calculate Dot Product (Cosine Similarity)
-    dot_product = img.multiply(centroid_img).reduce(ee.Reducer.sum()).rename('similarity')
+    dot_product = img.multiply(weights_img).reduce(ee.Reducer.sum()).rename('similarity')
     
     # --- Coarse Filtering Logic ---
     if coarse_filter:
         sys.stderr.write("Applying coarse scale (1km) filter...\n")
-        coarse_centroid_img = ee.Image.constant(list(coarse_filter['centroid'])).rename(emb_cols)
-        coarse_dot = img.multiply(coarse_centroid_img).reduce(ee.Reducer.sum())
+        coarse_weights_img = ee.Image.constant(list(coarse_filter['weights'])).rename(emb_cols)
+        coarse_dot = img.multiply(coarse_weights_img).reduce(ee.Reducer.sum())
         coarse_mask = coarse_dot.gte(coarse_filter['threshold'])
         dot_product = dot_product.updateMask(coarse_mask)
 
@@ -115,52 +115,125 @@ def generate_prediction_map(centroid, df=None, coarse_filter=None, aoi=None, yea
 
 
 
-def get_prediction_image(meta, df=None, coarse_filter=None, aoi=None, year=2025):
+
+def get_prediction_image(meta, df=None, coarse_filter=None, aoi=None, year=2025, scale=10):
     """
     Reconstructs an ee.Image prediction from metadata.
+
+    For reducer methods (ridge, linear, robust_linear):
+        Uses stored weights/intercept — no re-training needed.
+
+    For classifier methods (centroid, rf, gbt, cart, svm, maxent):
+        Re-trains using training data from meta['training_csv'] (or `df`).
+        All happens in the same GEE session; the classifier object never leaves.
     """
-    method = meta.get('method', 'centroid')
-    if method == "centroid":
-        return generate_prediction_map(
-            centroid=meta['centroids'][0] if isinstance(meta['centroids'][0], list) else meta['centroids'],
-            df=df,
-            coarse_filter=coarse_filter,
-            aoi=aoi,
-            year=year
-        )
-    elif method == "mean":
-        return generate_prediction_map(
-            centroid=meta['centroid'],
-            df=df,
-            coarse_filter=coarse_filter,
-            aoi=aoi,
-            year=year
-        )
-    elif method == "ridge":
-        # Linear Predictor: Dot(embs, weights) + intercept
-        weights = meta['weights']
-        intercept = meta['intercept']
-        emb_cols = [f"A{i:02d}" for i in range(64)]
-        
-        asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
-        img = ee.ImageCollection(asset_path)\
-            .filter(ee.Filter.calendarRange(year, year, 'year'))\
-            .mosaic()\
+    import ee, sys
+    from autoSDM.analyzer import GEE_CLASSIFIER_METHODS, GEE_REDUCER_METHODS
+
+    method     = meta.get('method', 'centroid')
+    emb_cols   = [f"A{i:02d}" for i in range(64)]
+    asset_path = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
+
+    # ── Reducer methods: dot-product image from stored weights ────────────
+    if method in GEE_REDUCER_METHODS or method == "mean":
+        weights   = meta.get('weights')
+        intercept = meta.get('intercept', 0.0)
+        if weights is None:
+            raise ValueError(f"get_prediction_image: no 'weights' in meta for method '{method}'.")
+
+        img = (
+            ee.ImageCollection(asset_path)
+            .filter(ee.Filter.calendarRange(year, year, 'year'))
+            .mosaic()
             .select(emb_cols)
-        
+        )
         weights_img = ee.Image.constant(list(weights)).rename(emb_cols)
-        prediction = img.multiply(weights_img).reduce(ee.Reducer.sum()).add(intercept).rename('similarity')
-        
-        # Determine AOI
+        prediction  = img.multiply(weights_img).reduce(ee.Reducer.sum()).add(intercept).rename('similarity')
+
         if aoi is None:
-            if df is None: raise ValueError("df or aoi required")
-            min_lat, max_lat = df['latitude'].min(), df['latitude'].max()
-            min_lon, max_lon = df['longitude'].min(), df['longitude'].max()
-            aoi = ee.Geometry.Rectangle([min_lon - 0.01, min_lat - 0.01, max_lon + 0.01, max_lat + 0.01])
-            
+            if df is None:
+                raise ValueError("get_prediction_image: df or aoi required for reducer methods.")
+            aoi = ee.Geometry.Rectangle([
+                df['longitude'].min() - 0.01, df['latitude'].min() - 0.01,
+                df['longitude'].max() + 0.01, df['latitude'].max() + 0.01,
+            ])
         return prediction, aoi
+
+    # ── Classifier methods: re-train from CSV, classify image ─────────────
+    if method not in GEE_CLASSIFIER_METHODS:
+        raise ValueError(f"get_prediction_image: unsupported method '{method}'.")
+
+    # Load training data — for classifiers, prefer the stored CSV (has both classes)
+    training_csv = meta.get('training_csv')
+    if training_csv and os.path.exists(training_csv):
+        import pandas as pd
+        df = pd.read_csv(training_csv)
+        sys.stderr.write(f"{method}: loading training data from {training_csv} ...\n")
+    elif df is None:
+        raise ValueError(f"get_prediction_image: need df or meta['training_csv'] for classifier method '{method}'.")
     else:
-        raise ValueError(f"Method '{method}' does not currently support GEE map generation. Use 'centroid', 'mean', or 'ridge'.")
+        sys.stderr.write(f"{method}: using provided df for map generation (no training_csv in meta) ...\n")
+
+
+    sys.stderr.write(f"{method}: re-uploading training data for map generation ...\n")
+
+    LABEL_COL = "label"
+    import numpy as np
+    class_property = 'present' if 'present' in df.columns else df.columns[0]
+    df = df.copy()
+    df[LABEL_COL] = np.where(df[class_property] == 1, 1, 0).astype(int)
+    year_col = int(df['year'].iloc[0]) if 'year' in df.columns else year
+
+    MP_CHUNK = 5000
+    gee_features = []
+    for (yr, lv), grp in df.groupby(['year', LABEL_COL]):
+        coords = grp[['longitude', 'latitude']].values.tolist()
+        for i in range(0, len(coords), MP_CHUNK):
+            geom  = ee.Geometry.MultiPoint(coords[i: i + MP_CHUNK])
+            gee_features.append(ee.Feature(geom, {LABEL_COL: int(lv)}).set("year", int(yr)))
+
+    upload_fc = ee.FeatureCollection(gee_features)
+
+    sys.stderr.write(f"{method}: sampling embeddings for map generation ...\n")
+    yr_img = (
+        ee.ImageCollection(asset_path)
+        .filter(ee.Filter.calendarRange(year, year, 'year'))
+        .mosaic()
+        .select(emb_cols)
+    )
+    sampled_fc = yr_img.sampleRegions(
+        collection=upload_fc, properties=[LABEL_COL], scale=scale, geometries=False
+    ).filter(ee.Filter.notNull(["A00"]))
+
+    # ── Verify both classes are present after sampling ────────────────────
+    class_counts = sampled_fc.aggregate_histogram(LABEL_COL).getInfo()
+    if len(class_counts) < 2:
+        raise ValueError(f"get_prediction_image: only one class ({list(class_counts.keys())}) found after sampling at scale {scale}. "
+                         "This usually happens if points are clustered in masked pixels.")
+
+    params = meta.get('params', {})
+    clf    = GEE_CLASSIFIER_METHODS[method](params)
+    trained_clf = clf.train(features=sampled_fc, classProperty=LABEL_COL, inputProperties=emb_cols)
+
+
+    sys.stderr.write(f"{method}: classifying image ...\n")
+    score_col = "probability" if method == "maxent" else "classification"
+    prediction = yr_img.classify(trained_clf).select(score_col)
+    
+    if method == "svm":
+        prediction = ee.Image(1.0).subtract(prediction)
+        
+    prediction = prediction.rename('similarity')
+
+    if aoi is None:
+        aoi = ee.Geometry.Rectangle([
+            df['longitude'].min() - 0.01, df['latitude'].min() - 0.01,
+            df['longitude'].max() + 0.01, df['latitude'].max() + 0.01,
+        ])
+
+    return prediction, aoi
+
+
 
 import math
 

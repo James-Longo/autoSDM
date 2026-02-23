@@ -288,97 +288,120 @@ def run_cv_fold(fold_idx, all_sampled_fc, primary_img, emb_cols,
     """
     Evaluate a single CV fold using a pre-sampled FeatureCollection.
 
-    IMPORTANT: all_sampled_fc already contains GEE-side embedding values
-    (from the single sampleRegions call in run_parallel_cv).  No new
-    sampleRegions calls are made here.
+    Supports all GEE classifier methods (centroid, rf, gbt, cart, svm,
+    maxent) via ee.Classifier + PROBABILITY mode, and all reducer methods
+    (ridge, linear, robust_linear) via reduceColumns.
 
-    Training uses server-side reduceColumns for centroid mean and
-    ridgeRegression.  Test scoring uses _dot_product_on_fc which maps
-    the dot-product expression directly over the test subset — again,
-    no sampleRegions, no embedding download.
+    The ensemble score is the normalized product of all trained submodel scores.
     """
     import ee
+    from autoSDM.analyzer import GEE_CLASSIFIER_METHODS, GEE_REDUCER_METHODS
+
     train_methods = train_methods or ["centroid", "ridge"]
-    eval_methods = eval_methods or ["centroid", "ridge", "ensemble"]
+    eval_methods  = eval_methods  or ["ensemble"]
 
     train_fc = all_sampled_fc.filter(ee.Filter.neq(fold_col, fold_idx))
-    test_fc  = all_sampled_fc.filter(ee.Filter.eq(fold_col, fold_idx))
+    test_fc  = all_sampled_fc.filter(ee.Filter.eq(fold_col,  fold_idx))
 
     res_metrics = {}
-    c_sims, c_labels = None, None
-    r_sims, r_labels = None, None
+    # Store per-method scores for ensemble combination
+    method_sims   = {}  # method -> np.array of scores
+    method_labels = {}  # method -> np.array of 0/1 labels
 
-    # ------------------------------------------------------------------
-    # 1. Centroid
-    # ------------------------------------------------------------------
-    if 'centroid' in train_methods:
-        presence_train = train_fc.filter(ee.Filter.eq(label_col_cent, 1.0))
-        centroid_res   = presence_train.reduceColumns(
-            reducer=ee.Reducer.mean().repeat(len(emb_cols)),
-            selectors=emb_cols
-        ).getInfo()
-        centroid = centroid_res['mean']   # 64 numbers
+    for method in train_methods:
+        # ── GEE Classifier ────────────────────────────────────────────────
+        if method in GEE_CLASSIFIER_METHODS:
+            # Use binary 0/1 label (centroid label column stores 1.0/0.0)
+            clf = GEE_CLASSIFIER_METHODS[method]({})
+            trained = clf.train(
+                features=train_fc,
+                classProperty=label_col_cent,
+                inputProperties=emb_cols,
+            )
+            scored_test = test_fc.classify(trained)
+            
+            # Maxent uses 'probability' property, others use 'classification'
+            score_col = "probability" if method == "maxent" else "classification"
 
-        # Score test fold
-        c_sims, c_labels = _dot_product_on_fc(test_fc, centroid, emb_cols, label_col_cent)
-        
-        if 'centroid' in eval_methods:
-            res_metrics['centroid'] = calculate_classifier_metrics(
-                c_sims[c_labels == 1], c_sims[c_labels == 0]
+            result = scored_test.reduceColumns(
+                ee.Reducer.toList().repeat(2),
+                selectors=[score_col, label_col_cent]
+            ).getInfo()
+            sims   = np.array(result["list"][0], dtype=float)
+            if method == "svm":
+                sims = 1.0 - sims
+            labels = np.array(result["list"][1], dtype=float)
+
+        # ── GEE Reducer ───────────────────────────────────────────────────
+        elif method in GEE_REDUCER_METHODS:
+            train_fc_reg = train_fc.map(lambda f: f.set("constant", 1.0))
+            reducer_name, label_enc = GEE_REDUCER_METHODS[method]
+            lbl_col = label_col_ridge  # binary +1/-1
+            
+            if reducer_name == "ridgeRegression":
+                # Ridge has a native intercept at index 0
+                reducer  = ee.Reducer.ridgeRegression(numX=64, numY=1, lambda_=0.1)
+                result   = train_fc.reduceColumns(reducer=reducer, selectors=emb_cols + [lbl_col])
+                coef_flat = [float(row[0]) for row in result.get("coefficients").getInfo()]
+                intercept = coef_flat[0]; weights = coef_flat[1:]
+            elif reducer_name in ("linearRegression", "robustLinearRegression"):
+                # Linear needs our 'constant' column
+                train_fc_reg = train_fc.map(lambda f: f.set("constant", 1.0))
+                factory  = getattr(ee.Reducer, reducer_name)
+                reducer  = factory(numX=65, numY=1)
+                result   = train_fc_reg.reduceColumns(reducer=reducer, selectors=["constant"] + emb_cols + [lbl_col])
+                coef_flat = [float(row[0]) for row in result.get("coefficients").getInfo()]
+                intercept = coef_flat[0]; weights = coef_flat[1:]
+            elif reducer_name == "mean":
+                presence_fc = train_fc.filter(ee.Filter.eq(label_col_cent, 1))
+                centroid_res = presence_fc.reduceColumns(
+                    reducer=ee.Reducer.mean().repeat(len(emb_cols)), selectors=emb_cols
+                ).getInfo()
+                weights = [float(w) for w in centroid_res["mean"]]
+                intercept = 0.0
+            else:
+                continue  # linearFit not implemented in CV
+
+            sims, labels = _dot_product_on_fc(test_fc, weights, emb_cols, label_col_cent, intercept=intercept)
+        else:
+            continue
+
+        method_sims[method]   = sims
+        method_labels[method] = labels
+
+        if method in eval_methods:
+            res_metrics[method] = calculate_classifier_metrics(
+                sims[labels == 1], sims[labels == 0]
             )
 
-    # ------------------------------------------------------------------
-    # 2. Ridge
-    # ------------------------------------------------------------------
-    if 'ridge' in train_methods:
-        reducer    = ee.Reducer.ridgeRegression(numX=len(emb_cols), numY=1, lambda_=0.1)
-        result     = train_fc.reduceColumns(
-            reducer=reducer,
-            selectors=emb_cols + [label_col_ridge]
-        )
-        coef_flat  = [row[0] for row in result.get('coefficients').getInfo()]
-        intercept  = coef_flat[0]      # row 0 is intercept (GEE convention)
-        weights    = coef_flat[1:]     # rows 1-64 are feature weights
-
-        # Score test fold
-        r_sims, r_labels = _dot_product_on_fc(
-            test_fc, weights, emb_cols, label_col_cent, intercept=intercept
-        )
-        
-        if 'ridge' in eval_methods:
-            res_metrics['ridge'] = calculate_classifier_metrics(
-                r_sims[r_labels == 1], r_sims[r_labels == 0]
-            )
-
-    # ------------------------------------------------------------------
-    # 3. Ensemble
-    # ------------------------------------------------------------------
-    if 'ensemble' in eval_methods and c_sims is not None and r_sims is not None:
+    # ── Ensemble ──────────────────────────────────────────────────────────
+    if "ensemble" in eval_methods and len(method_sims) >= 2:
         def normalize(vals):
             v_min, v_max = np.min(vals), np.max(vals)
-            if v_max - v_min == 0:
-                return np.zeros_like(vals)
-            return (vals - v_min) / (v_max - v_min)
+            return (vals - v_min) / (v_max - v_min) if v_max > v_min else np.zeros_like(vals)
 
-        n = min(len(c_sims), len(r_sims))
-        e_sims   = normalize(normalize(c_sims[:n]) * normalize(r_sims[:n]))
-        e_labels = c_labels[:n]
-        res_metrics['ensemble'] = calculate_classifier_metrics(
-            e_sims[e_labels == 1], e_sims[e_labels == 0]
+        # Align lengths
+        n = min(len(v) for v in method_sims.values())
+        combined = np.zeros(n)
+        for m_sims in method_sims.values():
+            combined = combined + normalize(m_sims[:n])
+        combined = combined / len(method_sims)
+
+        any_labels = next(iter(method_labels.values()))[:n]
+        res_metrics["ensemble"] = calculate_classifier_metrics(
+            combined[any_labels == 1], combined[any_labels == 0]
         )
 
-    # Calculate counts (assume test_fc size doesn't change regardless of method)
-    # Using the last evaluated label set for counts
-    eval_labels = c_labels if c_labels is not None else r_labels
-    if eval_labels is not None:
-        n_pos = int(np.sum(eval_labels == 1))
-        n_neg = int(np.sum(eval_labels == 0))
-    else:
-        n_pos, n_neg = 0, 0
-        
-    res_metrics['counts'] = {'presence': n_pos, 'background': n_neg}
+    # ── Counts ────────────────────────────────────────────────────────────
+    any_labels = next(iter(method_labels.values())) if method_labels else np.array([])
+    res_metrics["counts"] = {
+        "presence":   int(np.sum(any_labels == 1)),
+        "background": int(np.sum(any_labels == 0)),
+    }
 
     return res_metrics
+
+
 
 
 def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, year=2025, n_folds=10, train_methods=None, eval_methods=None):
@@ -412,9 +435,11 @@ def run_parallel_cv(df, ecological_vars, class_property='present', scale=10, yea
     df_f[LABEL_CENT_COL]  = np.where(df_f[class_property] == 1,  1.0,  0.0)
     df_f[FOLD_COL]        = df_f['fold']
 
-    # Ensure year column
+    # Ensure year column — fill NaN (e.g. from background points that have no year)
     if 'year' not in df_f.columns:
         df_f['year'] = year
+    else:
+        df_f['year'] = df_f['year'].fillna(year).astype(int)
 
     # ------------------------------------------------------------------
     # 1. Upload ALL coords + fold + labels as compact MultiPoint features

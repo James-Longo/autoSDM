@@ -10,7 +10,6 @@ import sys
 import json
 import concurrent.futures
 from autoSDM.extractor import GEEExtractor
-from autoSDM.analyzer import analyze_embeddings
 from autoSDM.extrapolate import generate_prediction_map, download_mask, export_to_gcs, merge_rasters
 from shapely.geometry import mapping
 
@@ -88,76 +87,64 @@ def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df, ye
     try:
         sp_dir = os.path.join(output_dir, str(sp))
         os.makedirs(sp_dir, exist_ok=True)
-        
-        # 0. Merge master embeddings into this species dataframe
+
+        # Merge master embeddings into this species dataframe
         df_sp = pd.merge(df_sp, master_sampled_df, on=['longitude', 'latitude', 'year'], how='inner')
-        
         if df_sp.empty:
             sys.stderr.write(f"--- Warning: No valid points for {sp} after embedding merge ---\n")
             return
 
-        from autoSDM.analyzer import analyze_ridge, analyze_embeddings
+        from autoSDM.analyzer import analyze_method, GEE_CLASSIFIER_METHODS
         from autoSDM.extrapolate import get_prediction_image
-        
+
+        method = args.method if args.method != "ensemble" else "centroid"
         has_absences = (df_sp['present'] == 0).any() if 'present' in df_sp.columns else False
-        
-        # Determine method to use
-        method_to_use = args.method
-        if method_to_use == "ensemble":
-             method_to_use = "ridge" if has_absences else "centroid"
 
-        if method_to_use == "ridge":
-            if not has_absences:
-                n_bg = len(df_sp) * 10
-                sys.stderr.write(f"Presence-only data for {sp} (Ridge). Generating {n_bg} background points on GEE (10:1 ratio)...\n")
-                from autoSDM.trainer import get_background_embeddings
-                df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=year)
-                if not df_bg.empty:
-                    df_sp = pd.concat([df_sp, df_bg], ignore_index=True)
-            
-            res = analyze_ridge(df_sp)
-            meta = {"method": "ridge", "weights": res['weights'], "intercept": res['intercept'], "metrics": res['metrics']}
-            prefix = f"{sp}_ridge"
-        else:
-            # Default to Centroid for presence-only or if requested
-            if not has_absences and aoi:
-                n_bg = len(df_sp) * 10
-                sys.stderr.write(f"Presence-only data for {sp} (Centroid/Mean). Generating {n_bg} background points for evaluation (10:1 ratio)...\n")
-                from autoSDM.trainer import get_background_embeddings
-                df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=year)
-                if not df_bg.empty:
-                    df_sp = pd.concat([df_sp, df_bg], ignore_index=True)
+        if not has_absences and aoi:
+            n_bg = args.count if args.count else len(df_sp) * 10
+            sys.stderr.write(f"{sp} ({method}): generating {n_bg} background points...\n")
+            from autoSDM.trainer import get_background_embeddings
+            df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=year)
+            if not df_bg.empty:
+                df_sp = pd.concat([df_sp, df_bg], ignore_index=True)
 
-            res = analyze_embeddings(df_sp)
-            meta = {"method": "centroid", "centroids": res['centroids'], "metrics": res['metrics']}
-            prefix = f"{sp}_centroid"
+        params = {}
+        if method in ("rf", "gbt"): params = {"numberOfTrees": getattr(args, 'n_trees', 100)}
+        if method == "svm":          params = {"kernelType": getattr(args, 'svm_kernel', 'RBF')}
 
-        with open(os.path.join(sp_dir, f"{meta['method']}.json"), 'w') as f: 
+        res  = analyze_method(df_sp, method=method, params=params, scale=args.scale, year=year)
+        meta = {"method": method, "params": params, "metrics": res['metrics'],
+                "similarity_range": res.get('similarity_range')}
+        if 'weights' in res:
+            meta['weights'] = res['weights']; meta['intercept'] = res['intercept']
+
+        json_path = os.path.join(sp_dir, f"{method}.json")
+        # Save CSV so classifiers can reload it for map generation
+        csv_path  = os.path.join(sp_dir, f"{method}.csv")
+        res['clean_data'].to_csv(csv_path, index=False)
+        if method in GEE_CLASSIFIER_METHODS:
+            meta['training_csv'] = os.path.abspath(csv_path)
+
+        with open(json_path, 'w') as f:
             json.dump(meta, f)
-        
-        # Prediction Map
-        img, _ = get_prediction_image(meta, aoi=aoi, year=year)
+
+        img, _ = get_prediction_image(meta, aoi=aoi, year=year, scale=args.scale)
         if aoi:
             img = img.clip(aoi)
-        
-        results = {
-            "species": sp,
-            "method": meta['method'],
-            "metrics": res['metrics']
-        }
+
         with open(os.path.join(sp_dir, "results.json"), 'w') as f:
-            json.dump(results, f)
-        
+            json.dump({"species": sp, "method": method, "metrics": res['metrics']}, f)
+
         if aoi and not args.view:
             from autoSDM.extrapolate import download_mask
-            sim_path = os.path.join(sp_dir, f"{prefix}_{args.scale}m.tif")
-            download_mask(img, aoi, args.scale, sim_path)
+            download_mask(img, aoi, args.scale, os.path.join(sp_dir, f"{sp}_{method}_{args.scale}m.tif"))
 
         sys.stderr.write(f"--- Completed: {sp} ---\n")
     except Exception as e:
         sys.stderr.write(f"--- Failed: {sp} | {e} ---\n")
         import traceback
         traceback.print_exc()
+
 
 def run_multi_species_pipeline(args, df, output_dir):
     species_list = df[args.species_col].unique()
@@ -227,7 +214,14 @@ def main():
     parser.add_argument("--gcs-bucket", help="GCS bucket name for server-side export (bypasses local download)")
     parser.add_argument("--wait", action="store_true", help="Wait for the export task(s) to complete and show progress updates.")
     parser.add_argument("--zip", action="store_true", help="Zip the output rasters (only for local download mode).")
-    parser.add_argument("--method", choices=["centroid", "ridge", "ensemble"], default="centroid", help="Modeling method. Use 'ridge' for presence-absence and 'centroid' for presence-only.")
+    parser.add_argument("--method",
+        choices=["centroid", "rf", "gbt", "cart", "svm", "maxent",
+                 "ridge", "linear", "robust_linear", "ensemble", "mean"],
+        default="centroid",
+        help="Modeling method (GEE classifier or regression reducer).")
+    parser.add_argument("--n-trees", type=int, default=100, help="Number of trees for rf/gbt (default: 100)")
+    parser.add_argument("--svm-kernel", default="RBF", choices=["LINEAR","POLY","RBF","SIGMOID"], help="SVM kernel type (default: RBF)")
+    parser.add_argument("--lambda", type=float, default=0.1, dest="lambda_", help="Regularisation strength for ridge/linear reducers (default: 0.1)")
     parser.add_argument("--prefix", help="Prefix for output raster filenames (default: 'prediction_map')")
     parser.add_argument("--only-similarity", action="store_true", help="Only generate/download similarity map (skip masks)")
     parser.add_argument("--lat", type=float, help="Latitude for AOI center")
@@ -305,177 +299,83 @@ def main():
         except Exception:
             pass
 
-        if args.method == "centroid":
-            from autoSDM.analyzer import analyze_embeddings
-            has_absences = (df['present'] == 0).any() if 'present' in df.columns else False
-            
-            if not has_absences:
-                sys.stderr.write("Presence-only data detected for Centroid. Attempting background generation for evaluation...\n")
-                # Reconstruct AOI
-                aoi = None
-                if args.lat is not None and args.lon is not None and args.radius is not None:
-                    aoi = ee.Geometry.Point([args.lon, args.lat]).buffer(args.radius)
-                elif args.aoi_path:
-                    import geopandas as gpd
-                    gdf = gpd.read_file(args.aoi_path)
-                    if gdf.crs and gdf.crs.to_epsg() != 4326: gdf = gdf.to_crs(epsg=4326)
-                    # Use full polygon geometry
-                    aoi = ee.Geometry(mapping(gdf.geometry.unary_union))
-                
-                if aoi:
-                    from autoSDM.trainer import get_background_embeddings
-                    n_bg = args.count if args.count else len(df) * 10
-                    sys.stderr.write(f"Presence-only data detected for Centroid. Generating {n_bg} background points for evaluation (Override: {bool(args.count)})...\n")
-                    
-                    # Label existing points before adding background
-                    if 'type' not in df.columns:
-                        df['type'] = df['present'].map({1: 'presence', 0: 'absence'})
+        from autoSDM.analyzer import analyze_method, GEE_CLASSIFIER_METHODS, GEE_REDUCER_METHODS
 
-                    df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=args.year)
-                    if not df_bg.empty:
-                        df = pd.concat([df, df_bg], ignore_index=True)
-                else:
-                    sys.stderr.write("Warning: No AOI provided, skipping background generation for Centroid metrics.\n")
+        method = args.method
 
-            if 'type' not in df.columns:
-                 df['type'] = df['present'].map({1: 'presence', 0: 'absence'})
+        # Build method-specific hyperparameter dict
+        params = {}
+        if method in ("rf",):
+            params = {"numberOfTrees": args.n_trees}
+        elif method == "gbt":
+            params = {"numberOfTrees": args.n_trees}
+        elif method == "svm":
+            params = {"kernelType": args.svm_kernel}
+        elif method in ("ridge", "linear", "robust_linear"):
+            params = {"lambda_": args.lambda_}
 
-            res = analyze_embeddings(df, scale=args.scale, year=args.year)
-            # clean_data already contains a 'similarity' column from GEE scoring
-            os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-            res['clean_data'].to_csv(args.output, index=False)
-            
-            # Save metadata
-            meta = {
-                "method": "centroid",
-                "centroids": res['centroids'],
-                "metrics": res['metrics'],
-                "cv_results": None,
-                "similarity_range": res.get('similarity_range'),
-                "similarities": res.get('similarities')
-            }
-            
-            if args.cv:
-                cv_results = get_cached_cv(args, df)
-                
-                # Export CV points CSV
-                if 'df' in cv_results:
-                    cv_points_path = args.output.replace('.json', '_points.csv') if args.output.endswith('.json') else args.output + "_points.csv"
-                    cv_results['df'].to_csv(cv_points_path, index=False)
-                    sys.stderr.write(f"CV points with fold assignments saved to {cv_points_path}\n")
-
-                cv_res = cv_results.get('average', {})
-                
-                # Extract Ensemble metrics to separate file
-                if 'ensemble' in cv_res:
-                    ensemble_metrics = cv_res.pop('ensemble')
-                    base_dir = os.path.dirname(args.output) if os.path.dirname(args.output) else "."
-                    ensemble_path = os.path.join(base_dir, "ensemble.json")
-                    
-                    # Create a proper structure for ensemble.json
-                    ensemble_meta = {
-                        "method": "ensemble",
-                        "metrics": ensemble_metrics, 
-                        "cv_results": ensemble_metrics
-                    }
-                    
-                    with open(ensemble_path, 'w') as f:
-                        json.dump(ensemble_meta, f)
-                    sys.stderr.write(f"Ensemble metrics saved to {ensemble_path}\n")
-                
-                meta["cv_results"] = cv_res.get('centroid')
-
-        elif args.method == "ridge":
-            from autoSDM.analyzer import analyze_ridge
-            has_absences = (df['present'] == 0).any() if 'present' in df.columns else False
-            if not has_absences:
-                sys.stderr.write("Presence-only data detected for Ridge. Generating background points on GEE...\n")
-                # Reconstruct AOI for background sampling
-                aoi = None
-                if args.lat is not None and args.lon is not None and args.radius is not None:
-                    aoi = ee.Geometry.Point([args.lon, args.lat]).buffer(args.radius)
-                elif args.aoi_path:
-                    import geopandas as gpd
-                    gdf = gpd.read_file(args.aoi_path)
-                    if gdf.crs and gdf.crs.to_epsg() != 4326: gdf = gdf.to_crs(epsg=4326)
-                    # Use full polygon geometry
-                    aoi = ee.Geometry(mapping(gdf.geometry.unary_union))
-                else:
-                    # Fallback to bounding box of presences
-                    min_lat, max_lat = df['latitude'].min(), df['latitude'].max()
-                    min_lon, max_lon = df['longitude'].min(), df['longitude'].max()
-                    aoi = ee.Geometry.Rectangle([min_lon - 0.1, min_lat - 0.1, max_lon + 0.1, max_lat + 0.1])
-                
-                from autoSDM.trainer import get_background_embeddings
-                n_bg = args.count if args.count else len(df) * 10
-                sys.stderr.write(f"Presence-only data detected for Ridge. Generating {n_bg} background points on GEE (Override: {bool(args.count)})...\n")
-                
-                # Label existing points before adding background
-                if 'type' not in df.columns:
-                    df['type'] = df['present'].map({1: 'presence', 0: 'absence'})
-
-                df_bg = get_background_embeddings(aoi, n_points=n_bg, scale=args.scale, year=args.year)
-                if not df_bg.empty:
-                    df = pd.concat([df, df_bg], ignore_index=True)
-
-            res = analyze_ridge(df)
-            # clean_data already contains a 'similarity' column from GEE scoring
-            os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-            res['clean_data'].to_csv(args.output, index=False)
-            meta = {
-                "method": "ridge",
-                "weights": res['weights'],
-                "intercept": res['intercept'],
-                "metrics": res['metrics'],
-                "cv_results": None,
-                "similarity_range": res.get('similarity_range'),
-                "similarities": res.get('similarities')
-            }
-
-            if args.cv:
-                cv_results = get_cached_cv(args, df)
-                
-                # Export CV points CSV
-                if 'df' in cv_results:
-                    cv_points_path = args.output.replace('.json', '_points.csv') if args.output.endswith('.json') else args.output + "_points.csv"
-                    cv_results['df'].to_csv(cv_points_path, index=False)
-                    sys.stderr.write(f"CV points with fold assignments saved to {cv_points_path}\n")
-
-                cv_res = cv_results.get('average', {})
-                
-                # Extract Ensemble metrics to separate file
-                if 'ensemble' in cv_res:
-                    ensemble_metrics = cv_res.pop('ensemble')
-                    base_dir = os.path.dirname(args.output) if os.path.dirname(args.output) else "."
-                    ensemble_path = os.path.join(base_dir, "ensemble.json")
-                    
-                    # Create a proper structure for ensemble.json
-                    ensemble_meta = {
-                        "method": "ensemble",
-                        "metrics": ensemble_metrics, 
-                        "cv_results": ensemble_metrics
-                    }
-                    
-                    with open(ensemble_path, 'w') as f:
-                        json.dump(ensemble_meta, f)
-                    sys.stderr.write(f"Ensemble metrics saved to {ensemble_path}\n")
-                
-                meta["cv_results"] = cv_res.get('ridge')
-        elif args.method == "mean":
-            from autoSDM.analyzer import analyze_mean
-            res = analyze_mean(df)
-            res['clean_data']['similarity'] = res['similarities']
-            os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-            res['clean_data'].to_csv(args.output, index=False)
-            meta = {
-                "method": "mean",
-                "centroid": res['centroid'],
-                "metrics": res['metrics']
-            }
-        elif args.method == "ensemble":
-            # Multi-species pipeline
+        if method == "ensemble":
             run_multi_species_pipeline(args, df, args.output)
-            return # Skip standard save logic
+            return
+
+        # ── Unified path for all classifiers, reducers, and local mean ────
+        needs_bg = method in GEE_CLASSIFIER_METHODS or method in GEE_REDUCER_METHODS
+        has_absences = (df['present'] == 0).any() if 'present' in df.columns else False
+
+        if needs_bg and not has_absences:
+            sys.stderr.write(f"{method}: presence-only data — generating background points on GEE...\n")
+            aoi_geom = None
+            if args.lat is not None and args.lon is not None and args.radius is not None:
+                aoi_geom = ee.Geometry.Point([args.lon, args.lat]).buffer(args.radius)
+            elif args.aoi_path:
+                import geopandas as gpd
+                gdf = gpd.read_file(args.aoi_path)
+                if gdf.crs and gdf.crs.to_epsg() != 4326:
+                    gdf = gdf.to_crs(epsg=4326)
+                aoi_geom = ee.Geometry(mapping(gdf.geometry.unary_union))
+            else:
+                min_lat, max_lat = df['latitude'].min(), df['latitude'].max()
+                min_lon, max_lon = df['longitude'].min(), df['longitude'].max()
+                aoi_geom = ee.Geometry.Rectangle([min_lon - 0.1, min_lat - 0.1, max_lon + 0.1, max_lat + 0.1])
+
+            from autoSDM.trainer import get_background_embeddings
+            n_bg = args.count if args.count else len(df) * 10
+            sys.stderr.write(f"{method}: generating {n_bg} background points (Override: {bool(args.count)})...\n")
+            if 'type' not in df.columns:
+                df['type'] = df['present'].map({1: 'presence', 0: 'absence'})
+            df_bg = get_background_embeddings(aoi_geom, n_points=n_bg, scale=args.scale, year=args.year)
+            if not df_bg.empty:
+                df = pd.concat([df, df_bg], ignore_index=True)
+
+        res = analyze_method(df, method=method, params=params, scale=args.scale, year=args.year)
+
+        os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
+        res['clean_data'].to_csv(args.output, index=False)
+
+        meta = {
+            "method":           method,
+            "params":           params,
+            "metrics":          res['metrics'],
+            "cv_results":       None,
+            "similarity_range": res.get('similarity_range'),
+            "similarities":     res.get('similarities'),
+        }
+        # Standardised model weights/intercept
+        if 'weights' in res:
+            meta['weights']   = res['weights']
+            meta['intercept'] = res['intercept']
+
+        # Classifier methods: store CSV path so get_prediction_image() can reload
+        # the full training data (with lat/lon + both classes) at map time
+        from autoSDM.analyzer import GEE_CLASSIFIER_METHODS as _CLF_METHODS
+        if method in _CLF_METHODS:
+            meta['training_csv'] = os.path.abspath(args.output)
+
+        if args.cv:
+            cv_results = get_cached_cv(args, df)
+            cv_res = cv_results.get('average', {})
+            meta["cv_results"] = cv_res.get(method)
+
 
         if args.output.endswith('.csv'):
             meta_path = args.output.replace('.csv', '.json')
@@ -497,6 +397,8 @@ def main():
         if has_embeddings:
             sys.stderr.write("Using existing embeddings from input CSV.\n")
             df_emb = df
+            # Still need to initialize GEE for classifier-based predictions
+            extractor = GEEExtractor(args.key, project=args.project)
         else:
             # 1. Extract Embeddings for these specific points
             extractor = GEEExtractor(args.key, project=args.project)
@@ -520,28 +422,38 @@ def main():
             # Extract coarse embeddings for filtering
             df_coarse = extractor.extract_embeddings(df, scale=1000)
             if not df_coarse.empty:
-                coarse_centroids = [np.array(c) for c in coarse_meta['centroids']]
                 coarse_emb_cols = [f"A{i:02d}" for i in range(64)]
-                coarse_sim_matrix = np.dot(df_coarse[coarse_emb_cols].values, np.array(coarse_centroids).T)
-                coarse_sims = np.max(coarse_sim_matrix, axis=1)
-                
+                # Unified linear prediction (Centroid, Ridge, Linear, etc.)
+                c_weights = np.array(coarse_meta['weights'])
+                c_intercept = coarse_meta.get('intercept', 0.0)
+                coarse_sims = np.dot(df_coarse[coarse_emb_cols].values, c_weights) + c_intercept
+                    
                 # Filter df_emb based on coarse threshold
                 valid_mask = coarse_sims >= coarse_meta.get('threshold_5pct', -1)
                 df_emb = df_emb[valid_mask].copy()
                 sys.stderr.write(f"Coarse filter dropped {np.sum(~valid_mask)} points.\n")
 
         emb_cols = [f"A{i:02d}" for i in range(64)]
-        if method == "centroid":
-            centroids = [np.array(c) for c in meta['centroids']]
-            sim_matrix = np.dot(df_emb[emb_cols].values, np.array(centroids).T)
-            df_emb['similarity'] = np.max(sim_matrix, axis=1)
         
-
-
-        elif method == "ridge":
-            weights = np.array(meta['weights'])
-            intercept = meta['intercept']
+        # 4. Point Prediction
+        if method in ("centroid", "mean", "ridge", "linear", "robust_linear"):
+            weights   = np.array(meta['weights'])
+            intercept = meta.get('intercept', 0.0)
             df_emb['similarity'] = np.dot(df_emb[emb_cols].values, weights) + intercept
+        else:
+            # GEE Classifier Path (RF, GBT, SVM, MaxEnt)
+            training_csv = meta.get('training_csv')
+            if training_csv and os.path.exists(training_csv):
+                sys.stderr.write(f"Loading training data for GEE-based prediction from: {training_csv}\n")
+                df_train = pd.read_csv(training_csv)
+                from autoSDM.analyzer import predict_method
+                sims = predict_method(df_train, df_emb, method, params=meta.get('params'), scale=args.scale, year=args.year)
+                if sims is not None:
+                    df_emb['similarity'] = sims
+            else:
+                sys.stderr.write(f"Warning: No training_csv found for {method}. Defaulting to similarity=0.\n")
+                if 'similarity' not in df_emb.columns:
+                     df_emb['similarity'] = 0.0
             
 
 
@@ -633,37 +545,38 @@ def main():
                 with open(mp) as f:
                     mdata = json.load(f)
                 
-                img_i, aoi_i = get_prediction_image(mdata, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year)
+                img_i, aoi_i = get_prediction_image(mdata, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year, scale=args.scale)
                 if aoi is None: aoi = aoi_i
                 
                 # Normalize based on similarity_range from training metadata
                 s_range = mdata.get('similarity_range', [0.0, 1.0])
                 # Debugging: ensures we know why a default might be used
-                if 'similarity_range' not in mdata:
-                    sys.stderr.write(f"  Warning: 'similarity_range' missing in {mp}, using default [0, 1]\n")
+            ensemble_images = []
+            for i, mp in enumerate(meta_paths):
+                sys.stderr.write(f"Processing meta file {i+1}/{len(meta_paths)}: {mp}\n")
+                with open(mp) as f:
+                    mdata = json.load(f)
                 
-                # Check for null or invalid range
+                img_i, aoi_i = get_prediction_image(mdata, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year, scale=args.scale)
+                if aoi is None: aoi = aoi_i
+                
+                # Normalize based on similarity_range from training metadata
+                s_range = mdata.get('similarity_range', [0.0, 1.0])
                 if s_range is None or len(s_range) < 2:
-                    sys.stderr.write(f"  Warning: 'similarity_range' is invalid in {mp}, using default [0, 1]\n")
                     s_range = [0.0, 1.0]
 
                 s_min, s_max = s_range[0], s_range[1]
                 
                 # Rescale band to 0-1
                 if s_max - s_min > 1e-9:
-                    sys.stderr.write(f"  Normalizing layer to [0, 1] using range: {s_min:.4f} to {s_max:.4f}\n")
                     norm_img = img_i.select('similarity').subtract(s_min).divide(s_max - s_min)
                 else:
-                    sys.stderr.write(f"  Skipping normalization (zero range or default): {s_min:.4f} to {s_max:.4f}\n")
                     norm_img = img_i.select('similarity')
 
-                if prediction_map is None:
-                    prediction_map = norm_img
-                else:
-                    prediction_map = prediction_map.multiply(norm_img)
-                    sys.stderr.write(f"  After multiplying (normalized) {mp}, bands: {prediction_map.bandNames().getInfo()}\n")
+                ensemble_images.append(norm_img)
             
-            prediction_map = prediction_map.rename('similarity')
+            prediction_map = ee.ImageCollection.fromImages(ensemble_images).mean().rename('similarity')
+
 
             thresholds = {}
         else:
@@ -671,7 +584,7 @@ def main():
             with open(args.meta[0]) as f:
                 meta = json.load(f)
             
-            prediction_map_raw, aoi = get_prediction_image(meta, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year)
+            prediction_map_raw, aoi = get_prediction_image(meta, df, coarse_filter=coarse_filter, aoi=aoi, year=args.year, scale=args.scale)
             
             # Normalize single map if range exists
             s_range = meta.get('similarity_range', [0.0, 1.0])

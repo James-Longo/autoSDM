@@ -1,22 +1,32 @@
 #' autoSDM: Automated Species Distribution Modeling
 #'
-#' This is the main entry point for the autoSDM pipeline. It performs embedding extraction,
-#' multi-model analysis (Centroid + Ridge), and generates high-resolution distribution maps.
+#' This is the main entry point for the autoSDM pipeline.
 #'
 #' @param data A data frame formatted via `format_data()`. Must have standardized lowercase columns
-#'   (longitude, latitude, year, present). Any additional columns are ignored.
-#' @param aoi Optional. Either a list with `lat`, `lon`, and `radius` (in meters), or a character string path to a polygon file (GeoJSON or Shapefile). Required for map generation. If NULL and `predict_coords` is provided, only point predictions are returned (no map).
+#'   (longitude, latitude, year, present).
+#' @param aoi Optional. Either a list with `lat`, `lon`, and `radius` (in meters), or a character string path to a polygon file.
 #' @param output_dir Optional. Directory to save results. Defaults to the current working directory.
 #' @param scale Optional. Resolution in meters for the final map. Defaults to 10.
 #' @param python_path Optional. Path to Python executable. Auto-detected if not provided.
-#' @param gee_project Optional. Google Cloud Project ID for Earth Engine. Required for newer API versions.
-#' @param cv Optional. Boolean whether to run 5-fold Spatial Block Cross-Validation. Defaults to FALSE.
+#' @param gee_project Optional. Google Cloud Project ID for Earth Engine.
+#' @param cv Optional. Boolean whether to run spatial cross-validation. Defaults to FALSE.
 #' @param predict_coords Optional. Data frame of coordinates to predict at.
 #' @param year Optional. Alpha Earth Mosaic year for mapping. Defaults to 2025.
-#' @param count Optional. Number of background points to generate. Defaults to 10x presence points (analyze) or 1000 (background).
+#' @param count Optional. Number of background points. Defaults to 10x presence points.
+#' @param methods Optional character vector of method names. Supported:
+#'   Classifiers: `"centroid"`, `"rf"`, `"gbt"`, `"cart"`, `"svm"`, `"maxent"`.
+#'   Reducers: `"ridge"`, `"linear"`, `"robust_linear"`.
+#'   Defaults to `c("centroid", "ridge")`.
+#' @param ensemble Optional. Combine all methods into an ensemble map. Defaults to TRUE.
+#' @param n_trees Optional. Number of trees for rf/gbt methods. Defaults to 100.
+#' @param svm_kernel Optional. Kernel for SVM (`"LINEAR"`, `"POLY"`, `"RBF"`, `"SIGMOID"`). Defaults to `"RBF"`.
+#' @param lambda_ Optional. Regularisation strength for ridge/linear reducers. Defaults to 0.1.
 #' @return A list containing training data, models, and prediction results.
 #' @export
-autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_path = NULL, gee_project = NULL, cv = FALSE, predict_coords = NULL, methods = NULL, ensemble = TRUE, year = 2025, count = NULL) {
+autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_path = NULL,
+                    gee_project = NULL, cv = FALSE, predict_coords = NULL,
+                    methods = NULL, ensemble = TRUE, year = 2025, count = NULL,
+                    n_trees = 100L, svm_kernel = "RBF", lambda_ = 0.1) {
   # 1. Input Validation
   if (missing(data)) stop("Argument 'data' is required.")
 
@@ -202,6 +212,9 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
       }
     }
 
+    # Track execution time for each method
+    execution_times <- list()
+
     # Loop through requested methods
     for (m in methods) {
       m_clean <- gsub("[^a-zA-Z0-9]", "", m)
@@ -220,6 +233,14 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
         NULL
       }
 
+      # Tuning args for this method
+      tuning_args <- c(
+        if (m %in% c("rf", "gbt")) c("--n-trees", as.character(as.integer(n_trees))),
+        if (m == "svm") c("--svm-kernel", svm_kernel),
+        if (m %in% c("ridge", "linear", "robust_linear")) c("--lambda", as.character(lambda_))
+      )
+
+      start_time <- Sys.time()
       system2(python_path, args = c(
         "-m", "autoSDM.cli", "analyze",
         "--input", shQuote(extract_csv),
@@ -228,8 +249,12 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
         "--scale", scale,
         "--year", year,
         if (!is.null(count)) c("--count", count) else NULL,
-        cv_arg_analyze, cv_cache_arg, proj_arg, aoi_arg
+        tuning_args, cv_arg_analyze, cv_cache_arg, proj_arg, aoi_arg
       ))
+      end_time <- Sys.time()
+
+      if (is.null(execution_times[[m]])) execution_times[[m]] <- list()
+      execution_times[[m]]$training_seconds <- as.numeric(difftime(end_time, start_time, units = "secs"))
 
       if (file.exists(out_json)) {
         meta_files[[m]] <- out_json
@@ -270,7 +295,12 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
           m_meta <- jsonlite::fromJSON(meta_p)
           s_range <- m_meta$similarity_range
 
+          pred_start_time <- Sys.time()
           preds <- predict_at_coords(pred_embedded, analysis_meta_path = meta_p, scale = scale, python_path = python_path, gee_project = gee_project)
+          pred_end_time <- Sys.time()
+
+          if (is.null(execution_times[[m]])) execution_times[[m]] <- list()
+          execution_times[[m]]$prediction_seconds <- as.numeric(difftime(pred_end_time, pred_start_time, units = "secs"))
 
           # Normalize to 0-1
           if (!is.null(s_range) && (s_range[2] - s_range[1] > 1e-9)) {
@@ -334,6 +364,8 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = 10, python_p
     }
 
     if (!is.null(predict_coords)) final_results$point_predictions <- point_preds
+    if (length(execution_times) > 0) final_results$execution_times <- execution_times
+
     message("autoSDM pipeline complete!")
     return(final_results)
   } else {
