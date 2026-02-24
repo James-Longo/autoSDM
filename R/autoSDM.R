@@ -14,19 +14,18 @@
 #' @param year Optional. Alpha Earth Mosaic year for mapping. Defaults to 2025.
 #' @param count Optional. Number of background points. Defaults to 10x presence points.
 #' @param methods Optional character vector of method names. Supported:
-#'   Classifiers: `"centroid"`, `"rf"`, `"gbt"`, `"cart"`, `"svm"`, `"maxent"`.
+#'   Classifiers: `"centroid"`, `"rf"`, `"gbt"`, `"cart"`, `"maxent"`.
 #'   Reducers: `"ridge"`, `"linear"`, `"robust_linear"`.
 #'   Defaults to `c("centroid", "ridge")`.
 #' @param ensemble Optional. Combine all methods into an ensemble map. Defaults to TRUE.
 #' @param n_trees Optional. Number of trees for rf/gbt methods. Defaults to 100.
-#' @param svm_kernel Optional. Kernel for SVM (`"LINEAR"`, `"POLY"`, `"RBF"`, `"SIGMOID"`). Defaults to `"RBF"`.
 #' @param lambda_ Optional. Regularisation strength for ridge/linear reducers. Defaults to 0.1.
 #' @return A list containing training data, models, and prediction results.
 #' @export
 autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = NULL, python_path = NULL,
                     gee_project = NULL, cv = FALSE, predict_coords = NULL,
                     methods = NULL, ensemble = TRUE, year = NULL, count = NULL,
-                    n_trees = 100L, svm_kernel = "RBF", lambda_ = 0.1) {
+                    n_trees = 100L, lambda_ = 0.1) {
   # 1. Input Validation
   if (missing(data)) stop("Argument 'data' is required.")
 
@@ -233,7 +232,6 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = NULL, python
       # Tuning args for this method
       tuning_args <- c(
         if (m %in% c("rf", "gbt")) c("--n-trees", as.character(as.integer(n_trees))),
-        if (m == "svm") c("--svm-kernel", svm_kernel),
         if (m %in% c("ridge", "linear", "robust_linear")) c("--lambda", as.character(lambda_))
       )
 
@@ -290,8 +288,10 @@ autoSDM <- function(data, aoi = NULL, output_dir = getwd(), scale = NULL, python
       message("--- Step: Predicting at specific coordinates (Parallel) ---")
 
       pred_results <- parallel::mclapply(methods, function(m) {
-        meta_p <- file.path(output_dir, paste0(m, ".json"))
+        m_clean <- gsub("[^a-zA-Z0-9]", "", m)
+        meta_p <- file.path(output_dir, paste0(m_clean, ".json"))
         if (!file.exists(meta_p)) {
+          message(sprintf("--- Warning: %s metadata not found at %s ---", m, meta_p))
           return(NULL)
         }
 

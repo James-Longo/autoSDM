@@ -144,7 +144,6 @@ GEE_CLASSIFIER_METHODS = {
     "rf":               lambda p: _build_classifier("smileRandomForest",     {"numberOfTrees": p.get("numberOfTrees", 100), **p}),
     "gbt":              lambda p: _build_classifier("smileGradientTreeBoost",{"numberOfTrees": p.get("numberOfTrees", 100), **p}),
     "cart":             lambda p: _build_classifier("smileCart",             p),
-    "svm":              lambda p: _build_classifier("libsvm",                p),
     "maxent":           lambda p: _build_classifier("amnhMaxent",            p),
 }
 
@@ -156,7 +155,6 @@ GEE_REDUCER_METHODS = {
     "centroid":       ("mean",                   "presence"),
     "ridge":          ("ridgeRegression",        "binary"),
     "linear":         ("linearRegression",       "binary"),
-    "robust_linear":  ("robustLinearRegression", "binary"),
 }
 
 ALL_METHODS = list(GEE_CLASSIFIER_METHODS) + list(GEE_REDUCER_METHODS)
@@ -218,10 +216,13 @@ def analyze_method(df, method, params=None, class_property="present",
     if df_clean.empty:
         raise ValueError("analyze_method: no valid rows after dropping NAs.")
 
-    if year is not None:
-        df_clean["year"] = int(year)
-    elif "year" not in df_clean.columns:
-        raise ValueError(f"analyze_method: 'year' parameter or column must be provided (no default fallback).")
+    # Regression weighting to balance classes 1:1
+    pos_count = len(df_clean[df_clean[class_property] == 1])
+    neg_count = len(df_clean[df_clean[class_property] == 0])
+    sys.stderr.write(f"{method}: class counts: pos={pos_count}, neg={neg_count}\n")
+    w_pos = 1.0
+    w_neg = pos_count / neg_count if neg_count > 0 else 1.0
+    df_clean["case_weight"] = np.where(df_clean[class_property] == 1, w_pos, w_neg)
 
     # ── 2. Choose label encoding ──────────────────────────────────────────
     is_classifier = method in GEE_CLASSIFIER_METHODS
@@ -248,7 +249,7 @@ def analyze_method(df, method, params=None, class_property="present",
         f"(coordinates + labels only) ...\n"
     )
     
-    cols_to_upload = ["longitude", "latitude", "year", LABEL_COL]
+    cols_to_upload = ["longitude", "latitude", "year", LABEL_COL, "case_weight"]
     
     data_flat = df_clean[cols_to_upload].copy()
     if class_property != LABEL_COL:
@@ -268,8 +269,9 @@ def analyze_method(df, method, params=None, class_property="present",
             r = ee.List(row)
             lon = ee.Number(r.get(0))
             lat = ee.Number(r.get(1))
-            yr = ee.Number(r.get(2))
+            yr  = ee.Number(r.get(2))
             lbl = ee.Number(r.get(3))
+            w   = ee.Number(r.get(4))
             
             geom = ee.Geometry.Point([lon, lat])
             
@@ -277,11 +279,12 @@ def analyze_method(df, method, params=None, class_property="present",
                 'longitude': lon,
                 'latitude': lat,
                 'year': yr,
-                LABEL_COL: lbl.int() if is_classifier else lbl.float()
+                LABEL_COL: lbl.int() if is_classifier else lbl.float(),
+                'case_weight': w.float()
             })
             
             if class_property != LABEL_COL:
-                props = props.set(class_property, r.get(4))
+                props = props.set(class_property, r.get(5))
                 
             return ee.Feature(geom, props)
         
@@ -304,7 +307,7 @@ def analyze_method(df, method, params=None, class_property="present",
         )
         sampled = yr_img.sampleRegions(
             collection=yr_fc,
-            properties=[LABEL_COL, "longitude", "latitude", "year", class_property],
+            properties=[LABEL_COL, "longitude", "latitude", "year", class_property, "case_weight"],
             scale=scale,
             geometries=False,
             tileScale=16,
@@ -317,11 +320,21 @@ def analyze_method(df, method, params=None, class_property="present",
 
     # ── 5a. Train GEE classifier ──────────────────────────────────────────
     if is_classifier:
-        sys.stderr.write(f"{method}: training ee.Classifier.{GEE_CLASSIFIER_METHODS[method].__name__ if hasattr(GEE_CLASSIFIER_METHODS[method], '__name__') else method} ...\n")
+        sys.stderr.write(f"{method}: balancing training set (1:1) for classifier...\n")
+        # For classifiers that don't support weights, we subsample background to match presences
+        pos_fc = sampled_fc.filter(ee.Filter.eq(LABEL_COL, 1))
+        neg_fc = sampled_fc.filter(ee.Filter.eq(LABEL_COL, 0))
+        
+        pos_count = pos_fc.size()
+        
+        # Subsample background points to match presence count (1:1 ratio)
+        balanced_fc = pos_fc.merge(neg_fc.randomColumn().sort("random").limit(pos_count))
+        
+        sys.stderr.write(f"{method}: training ee.Classifier.{GEE_CLASSIFIER_METHODS[method].__name__ if hasattr(GEE_CLASSIFIER_METHODS[method], '__name__') else method} on balanced dataset ...\n")
         clf = GEE_CLASSIFIER_METHODS[method](params)
-        trained = sampled_fc.classify(
+        trained = balanced_fc.classify(
             clf.train(
-                features=sampled_fc,
+                features=balanced_fc,
                 classProperty=LABEL_COL,
                 inputProperties=EMB_COLS,
             )
@@ -340,10 +353,7 @@ def analyze_method(df, method, params=None, class_property="present",
                              "This can happen if training fails or if all test points are in masked pixels.")
 
         sims   = np.array(result["list"][0], dtype=float)
-        # libsvm in GEE returns probability of class 0. We want class 1 (presence).
-        if method == "svm":
-            sims = 1.0 - sims
-            
+        
         labels = np.array(result["list"][1], dtype=float)
         lons   = np.array(result["list"][2], dtype=float)
         lats   = np.array(result["list"][3], dtype=float)
@@ -353,61 +363,123 @@ def analyze_method(df, method, params=None, class_property="present",
         intercept = 0.0
 
 
-    # ── 5b. Train GEE reducer ─────────────────────────────────────────────
+    # 5b. Train GEE reducer ─────────────────────────────────────────────
     elif is_reducer:
         reducer_name, _ = GEE_REDUCER_METHODS[method]
-        lambda_ = params.get("lambda_", 0.1)
-        
-        # For regression reducers, we add a constant 1.0 column to handle the intercept (bias).
-        # GEE's ridgeRegression treats the first X column as unregularized (bias).
-        fc_reg = sampled_fc.map(lambda f: f.set("constant", 1.0))
         
         sys.stderr.write(
             f"{method}: running ee.Reducer.{reducer_name} on GEE "
-            f"(lambda={lambda_ if 'ridge' in reducer_name else 'N/A'}) ...\n"
+            f"(lambda={params.get('lambda_', 0.1) if 'ridge' in reducer_name else 'N/A'}) ...\n"
         )
         
-        if reducer_name == "ridgeRegression":
-            # GEE ridgeRegression native intercept is the first element of a (numX+1) result.
-            reducer = ee.Reducer.ridgeRegression(numX=64, numY=1, lambda_=lambda_)
-            result  = sampled_fc.reduceColumns(
-                reducer=reducer, selectors=EMB_COLS + [LABEL_COL]
-            ).getInfo()
-            # coefs[0] is intercept, coefs[1:65] are weights for A00-A63.
-            coef_flat = [float(row[0]) for row in result.get("coefficients")]
-            intercept = coef_flat[0]
-            weights   = coef_flat[1:65]
-        elif reducer_name in ("linearRegression", "robustLinearRegression"):
-            fc_reg = sampled_fc.map(lambda f: f.set("constant", 1.0))
-            factory = getattr(ee.Reducer, reducer_name)
-            reducer = factory(numX=65, numY=1)
-            result  = fc_reg.reduceColumns(
-                reducer=reducer, selectors=["constant"] + EMB_COLS + [LABEL_COL]
-            ).getInfo()
-            # Pos 0 is coefficient for 'constant' (the intercept)
-            coef_flat = [float(row[0]) for row in result.get("coefficients")]
-            intercept = coef_flat[0]
-            weights   = coef_flat[1:65]
+        if reducer_name in ("ridgeRegression", "linearRegression", "robustLinearRegression"):
+            if reducer_name == "ridgeRegression":
+                # Ridge centering to avoid double-intercept issues
+                # Calculate weighted means for X and Y
+                means_res = sampled_fc.reduceColumns(
+                    reducer=ee.Reducer.mean().repeat(65), # 64 EMB_COLS + 1 LABEL_COL
+                    selectors=EMB_COLS + [LABEL_COL],
+                    weightSelectors=["case_weight"] * 65
+                ).getInfo()
+                
+                m_x = means_res["mean"][:64]
+                m_y = means_res["mean"][64]
+                
+                def center_and_weight(f):
+                    w = f.getNumber("case_weight")
+                    sw = w.sqrt()
+                    
+                    # Center X
+                    x_arr = f.toArray(EMB_COLS)
+                    x_centered = x_arr.subtract(ee.Array(m_x))
+                    
+                    w_cols = [f"w_{c}" for c in EMB_COLS]
+                    scaled_vals = x_centered.multiply(sw).toList()
+                    props = ee.Dictionary.fromLists(w_cols, scaled_vals)
+                    
+                    # Center Y
+                    y_centered = f.getNumber(LABEL_COL).subtract(m_y)
+                    
+                    return f.set(props).set({
+                        "w_label": y_centered.multiply(sw)
+                    })
+                
+                centered_fc = sampled_fc.map(center_and_weight)
+                
+                reducer = ee.Reducer.ridgeRegression(numX=64, numY=1, lambda_=params.get("lambda_", 0.1))
+                selectors = [f"w_{c}" for c in EMB_COLS] + ["w_label"]
+                
+                sys.stderr.write(f"{method}: running centered ee.Reducer.ridgeRegression (weighted 1:1, lambda={params.get('lambda_', 0.1)})...\n")
+                result = centered_fc.reduceColumns(reducer=reducer, selectors=selectors).getInfo()
+                
+                if not result or result.get("coefficients") is None:
+                    sys.stderr.write(f"{method}: ERROR: GEE returned no coefficients (possibly singular matrix).\n")
+                    intercept, weights = 0.0, [0.0] * 64
+                else:
+                    coefs = np.array(result.get("coefficients")).flatten()
+                    # coefficients[0] is the ridge intercept for centered data
+                    # We compute the final intercept: b0 = m_y - sum(weights * m_x) + GEE_intercept
+                    weights = coefs[1:65].tolist() # GEE returns [intercept_centered, w0, w1, ...]
+                    if len(weights) < 64: weights = weights + [0.0]*(64-len(weights))
+                    
+                    pred_at_mean = np.dot(weights, m_x)
+                    intercept = m_y - pred_at_mean + float(coefs[0])
+            else:
+                # Linear
+                def weight_inputs(f):
+                    lbl = f.getNumber(LABEL_COL)
+                    w = f.getNumber("case_weight")
+                    sw = w.sqrt()
+                    
+                    # For linear, we add a constant 1.0 column to handle the intercept (bias).
+                    # GEE's regression reducers treat the first X column as unregularized (bias).
+                    
+                    w_cols = [f"w_{c}" for c in EMB_COLS]
+                    scaled_vals = f.toArray(EMB_COLS).multiply(sw).toList()
+                    props = ee.Dictionary.fromLists(w_cols, scaled_vals)
+                    
+                    return f.set(props).set({
+                        "w_constant": sw,
+                        "w_label": lbl.multiply(sw)
+                    })
 
+                weighted_fc = sampled_fc.map(weight_inputs)
+                
+                reducer = getattr(ee.Reducer, reducer_name)(numX=65, numY=1)
+                selectors = ["w_constant"] + [f"w_{c}" for c in EMB_COLS] + ["w_label"]
+
+                sys.stderr.write(f"{method}: running ee.Reducer.{reducer_name} (weighted 1:1)...\n")
+                result  = weighted_fc.reduceColumns(reducer=reducer, selectors=selectors).getInfo()
+                
+                if not result or result.get("coefficients") is None:
+                     sys.stderr.write(f"{method}: ERROR: GEE returned no coefficients (possibly singular matrix).\n")
+                     intercept, weights = 0.0, [0.0] * 64
+                else:
+                     coefs = np.array(result.get("coefficients")).flatten()
+                     intercept = float(coefs[0])
+                     weights   = coefs[1:65].tolist()
+                     if len(weights) < 64:
+                          weights = weights + [0.0] * (64 - len(weights))
+            
+            sys.stderr.write(f"{method}: weights sum_abs={np.sum(np.abs(weights)):.4f}, intercept={intercept:.4f}\n")
 
         elif reducer_name == "mean":
             # Centroid similarity: compute mean embedding of presence points
             presence_fc = sampled_fc.filter(ee.Filter.eq(LABEL_COL, 1))
-            centroid_res = presence_fc.reduceColumns(
-                reducer=ee.Reducer.mean().repeat(64), selectors=EMB_COLS
+            res = presence_fc.reduceColumns(
+                reducer=ee.Reducer.mean().repeat(64), 
+                selectors=EMB_COLS
             ).getInfo()
-            weights = [float(w) for w in centroid_res["mean"]]
+            weights = [float(w) for w in res["mean"]]
             intercept = 0.0
         elif reducer_name == "linearFit":
-            # linearFit only takes 1 predictor; we project onto the PC1 direction
-            # by using the mean embedding as a single linear predictor weight
-            reducer = ee.Reducer.linearFit()
-            # Use centroid dot-product distance as the single predictor
-            presence_fc = sampled_fc.filter(ee.Filter.eq(LABEL_COL, 1.0))
-            centroid_res = presence_fc.reduceColumns(
-                reducer=ee.Reducer.mean().repeat(64), selectors=EMB_COLS
+            # Use presence-only mean embedding as the predictor weight
+            presence_fc = sampled_fc.filter(ee.Filter.eq(LABEL_COL, 1))
+            res = presence_fc.reduceColumns(
+                reducer=ee.Reducer.mean().repeat(64), 
+                selectors=EMB_COLS
             ).getInfo()
-            centroid = centroid_res["mean"]
+            centroid = res["mean"]
             # Score is the dot product (used as single X in linearFit)
             def add_dot(feat):
                 s = ee.Number(0)
@@ -427,15 +499,20 @@ def analyze_method(df, method, params=None, class_property="present",
             raise ValueError(f"Unsupported reducer: {reducer_name}")
 
         # ── 5c. Score training data on GEE ────────────────────────────────────
-        sys.stderr.write(f"{method}: calculating similarity scores on GEE ...\n")
+        sys.stderr.write(f"{method}: calculating similarity scores on GEE (weights[0]={float(weights[0]):.4f}, intercept={float(intercept):.4f}) ...\n")
         
-        # We calculate scores by mapping a dot product across the sampled collection
+        # Vectorized scoring using ee.Array is significantly faster and more stable
+        # weights_ee shape: [1, 64]
+        weights_ee = ee.Array([float(w) for w in weights]).reshape([1, 64])
+        intercept_ee = ee.Number(float(intercept))
+
         def score_feat(f):
-            # weights is a python list, intercept is a float
-            sim = ee.Number(intercept)
-            for i, col in enumerate(EMB_COLS):
-                sim = sim.add(ee.Number(f.get(col)).multiply(float(weights[i])))
-            return f.set('similarity', sim)
+            # Convert embedding properties to 1D array [64, 1]
+            emb_arr = f.toArray(EMB_COLS).reshape([64, 1])
+            # sim = (1,64) * (64,1) = (1,1) array
+            sim = weights_ee.matrixMultiply(emb_arr).add(intercept_ee)
+            # Get as scalar Number
+            return f.set('similarity', sim.get([0, 0]))
 
         scored_fc = sampled_fc.map(score_feat)
         
@@ -452,8 +529,12 @@ def analyze_method(df, method, params=None, class_property="present",
         yrs    = np.array(res["list"][4], dtype=int)
 
     # ── 6. Compute metrics ────────────────────────────────────────────────
-    pos_scores = sims[labels == 1]
-    neg_scores = sims[labels == 0]
+    if is_reducer and GEE_REDUCER_METHODS[method][1] == "binary":
+        pos_scores = sims[labels > 0]
+        neg_scores = sims[labels <= 0]
+    else:
+        pos_scores = sims[labels == 1]
+        neg_scores = sims[labels == 0]
     metrics    = calculate_classifier_metrics(pos_scores, neg_scores)
     sys.stderr.write(
         f"{method}: CBI={metrics.get('cbi', 0):.4f}, "
@@ -505,6 +586,14 @@ def predict_method(train_df, test_df, method, params=None, class_property="prese
 
     # 1. Prepare Training Data & Test Data IDs
     train_clean = train_df.dropna(subset=["longitude", "latitude", class_property]).copy()
+    
+    # Regression weighting to balance classes 1:1
+    pos_count = len(train_clean[train_clean[class_property] == 1])
+    neg_count = len(train_clean[train_clean[class_property] == 0])
+    w_pos = 1.0
+    w_neg = pos_count / neg_count if neg_count > 0 else 1.0
+    train_clean["case_weight"] = np.where(train_clean[class_property] == 1, w_pos, w_neg)
+
     if is_reducer:
         _, label_enc = GEE_REDUCER_METHODS[method]
         LABEL_COL = "label"
@@ -533,6 +622,8 @@ def predict_method(train_df, test_df, method, params=None, class_property="prese
                 raise ValueError(f"predict_method({method}): 'year' must be provided either as a column or an argument.")
             if '_point_id' in df.columns:
                 props['_point_id'] = int(r['_point_id'])
+            if 'case_weight' in df.columns:
+                props['case_weight'] = float(r['case_weight'])
             if label_col: props[label_col] = float(r[label_col]) if is_reducer else int(r[label_col])
             features.append(ee.Feature(geom, props))
         return ee.FeatureCollection(features)
@@ -561,7 +652,7 @@ def predict_method(train_df, test_df, method, params=None, class_property="prese
         yr_img = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL")\
             .filter(ee.Filter.calendarRange(int(yr), int(yr), 'year'))\
             .mosaic().select(EMB_COLS)
-        sampled_fcs.append(yr_img.sampleRegions(collection=yr_fc, properties=[LABEL_COL], scale=scale, geometries=False, tileScale=16))
+        sampled_fcs.append(yr_img.sampleRegions(collection=yr_fc, properties=[LABEL_COL, "case_weight"], scale=scale, geometries=False, tileScale=16))
     train_sampled = ee.FeatureCollection(sampled_fcs).flatten()
 
     # 4. Sample Test Data on GEE
@@ -590,35 +681,91 @@ def predict_method(train_df, test_df, method, params=None, class_property="prese
         # Reducer Path: Train (reduceColumns) and then Predict (map dot-product)
         reducer_name, _ = GEE_REDUCER_METHODS[method]
         
-        if reducer_name == "ridgeRegression":
-            reducer = ee.Reducer.ridgeRegression(numX=64, numY=1, lambda_=params.get("lambda_", 0.1))
-            res = train_sampled.reduceColumns(reducer=reducer, selectors=EMB_COLS + [LABEL_COL]).getInfo()
-            coefs = [float(row[0]) for row in res.get("coefficients")]
-            intercept, weights = coefs[0], coefs[1:]
-        elif reducer_name in ("linearRegression", "robustLinearRegression"):
-            train_fc_reg = train_sampled.map(lambda f: f.set("constant", 1.0))
-            factory = getattr(ee.Reducer, reducer_name)
-            reducer = factory(numX=65, numY=1)
-            res = train_fc_reg.reduceColumns(reducer=reducer, selectors=["constant"] + EMB_COLS + [LABEL_COL]).getInfo()
-            coefs = [float(row[0]) for row in res.get("coefficients")]
-            intercept, weights = coefs[0], coefs[1:]
+        if reducer_name in ("ridgeRegression", "linearRegression", "robustLinearRegression"):
+            if reducer_name == "ridgeRegression":
+                # Ridge centering using weighted training means
+                means_res = train_sampled.reduceColumns(
+                    reducer=ee.Reducer.mean().repeat(65),
+                    selectors=EMB_COLS + [LABEL_COL],
+                    weightSelectors=["case_weight"] * 65
+                ).getInfo()
+                m_x = means_res["mean"][:64]
+                m_y = means_res["mean"][64]
+                
+                def center_and_weight_train(f):
+                    w = f.getNumber("case_weight")
+                    sw = w.sqrt()
+                    x_centered = f.toArray(EMB_COLS).subtract(ee.Array(m_x))
+                    w_cols = [f"w_{c}" for c in EMB_COLS]
+                    scaled_vals = x_centered.multiply(sw).toList()
+                    props = ee.Dictionary.fromLists(w_cols, scaled_vals)
+                    y_centered = f.getNumber(LABEL_COL).subtract(m_y)
+                    return f.set(props).set({"w_label": y_centered.multiply(sw)})
+                
+                train_centered = train_sampled.map(center_and_weight_train)
+                reducer = ee.Reducer.ridgeRegression(numX=64, numY=1, lambda_=params.get("lambda_", 0.1))
+                selectors = [f"w_{c}" for c in EMB_COLS] + ["w_label"]
+                
+                res = train_centered.reduceColumns(reducer=reducer, selectors=selectors).getInfo()
+                if not res or res.get("coefficients") is None:
+                    sys.stderr.write(f"predict_method({method}): ERROR: GEE returned no coefficients.\n")
+                    intercept, weights = 0.0, [0.0] * 64
+                else:
+                    coefs = np.array(res.get("coefficients")).flatten()
+                    weights = coefs[1:65].tolist()
+                    if len(weights) < 64: weights = weights + [0.0]*(64-len(weights))
+                    pred_at_mean = np.dot(weights, m_x)
+                    intercept = m_y - pred_at_mean + float(coefs[0])
+            else:
+                # Linear
+                def weight_inputs_train(f):
+                    lbl = f.getNumber(LABEL_COL)
+                    w = f.getNumber("case_weight")
+                    sw = w.sqrt()
+                    w_cols = [f"w_{c}" for c in EMB_COLS]
+                    scaled_vals = f.toArray(EMB_COLS).multiply(sw).toList()
+                    props = ee.Dictionary.fromLists(w_cols, scaled_vals)
+                    return f.set(props).set({
+                        "w_constant": sw,
+                        "w_label": lbl.multiply(sw)
+                    })
+                
+                train_weighted = train_sampled.map(weight_inputs_train)
+                reducer = getattr(ee.Reducer, reducer_name)(numX=65, numY=1)
+                selectors = ["w_constant"] + [f"w_{c}" for c in EMB_COLS] + ["w_label"]
+                
+                res = train_weighted.reduceColumns(reducer=reducer, selectors=selectors).getInfo()
+                if not res or res.get("coefficients") is None:
+                    sys.stderr.write(f"predict_method({method}): ERROR: GEE returned no coefficients.\n")
+                    intercept, weights = 0.0, [0.0] * 64
+                else:
+                    coefs = np.array(res.get("coefficients")).flatten()
+                    intercept, weights = float(coefs[0]), coefs[1:65].tolist()
+                    if len(weights) < 64: weights = weights + [0.0]*(64-len(weights))
         elif reducer_name == "mean":
-            # Centroid
+            # Centroid: mean of presence points only
             presence_fc = train_sampled.filter(ee.Filter.eq(LABEL_COL, 1))
-            centroid_res = presence_fc.reduceColumns(ee.Reducer.mean().repeat(64), selectors=EMB_COLS).getInfo()
-            weights = [float(w) for w in centroid_res["mean"]]
+            res = presence_fc.reduceColumns(
+                reducer=ee.Reducer.mean().repeat(64), 
+                selectors=EMB_COLS
+            ).getInfo()
+            weights = [float(w) for w in res["mean"]]
             intercept = 0.0
         else:
             raise ValueError(f"predict_method: Reducer {reducer_name} not supported for GEE prediction.")
 
-        # Map dot-product prediction over test data on GEE
-        def predict_feat(f):
-            score = ee.Number(intercept)
-            for i, col in enumerate(EMB_COLS):
-                score = score.add(ee.Number(f.get(col)).multiply(float(weights[i])))
-            return f.set('similarity', score)
+        # Vectorized application of weights and intercept
+        sys.stderr.write(f"predict_method({method}): scoring test points on GEE (weights[0]={float(weights[0]):.4f}, intercept={float(intercept):.4f}) ...\n")
         
-        results = test_sampled.map(predict_feat).reduceColumns(ee.Reducer.toList(2), ["_point_id", "similarity"]).getInfo()
+        weights_ee = ee.Array([float(w) for w in weights]).reshape([1, 64])
+        intercept_ee = ee.Number(float(intercept))
+
+        def score_fc_point(feat):
+            emb_arr = feat.toArray(EMB_COLS).reshape([64, 1])
+            sim = weights_ee.matrixMultiply(emb_arr).add(intercept_ee)
+            return feat.set('similarity', sim.get([0, 0]))
+
+        results = test_sampled.map(score_fc_point).reduceColumns(ee.Reducer.toList(2), ["_point_id", "similarity"]).getInfo()
 
     # 6. Reconstruct predictions in same order
     out_dict = dict(results['list'])
@@ -628,8 +775,6 @@ def predict_method(train_df, test_df, method, params=None, class_property="prese
         val = out_dict.get(pid, np.nan)
         if val is not None and not np.isnan(val):
             val = float(val)
-            if method == "svm":
-                val = 1.0 - val
         else:
             val = np.nan
         sims.append(val)

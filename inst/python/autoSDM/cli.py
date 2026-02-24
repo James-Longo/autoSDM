@@ -111,8 +111,7 @@ def process_species_task(sp, df_sp, output_dir, args, aoi, master_sampled_df, ye
                 df_sp = pd.concat([df_sp, df_bg], ignore_index=True)
 
         params = {}
-        if method in ("rf", "gbt"): params = {"numberOfTrees": getattr(args, 'n_trees', 100)}
-        if method == "svm":          params = {"kernelType": getattr(args, 'svm_kernel', 'RBF')}
+        if method in ("rf", "gbt"):  params = {"numberOfTrees": args.n_trees}
 
         res  = analyze_method(df_sp, method=method, params=params, scale=args.scale, year=year)
         meta = {"method": method, "params": params, "metrics": res['metrics'],
@@ -216,12 +215,11 @@ def main():
     parser.add_argument("--wait", action="store_true", help="Wait for the export task(s) to complete and show progress updates.")
     parser.add_argument("--zip", action="store_true", help="Zip the output rasters (only for local download mode).")
     parser.add_argument("--method",
-        choices=["centroid", "rf", "gbt", "cart", "svm", "maxent",
+        choices=["centroid", "rf", "gbt", "cart", "maxent",
                  "ridge", "linear", "robust_linear", "ensemble", "mean"],
         default="centroid",
         help="Modeling method (GEE classifier or regression reducer).")
     parser.add_argument("--n-trees", type=int, default=100, help="Number of trees for rf/gbt (default: 100)")
-    parser.add_argument("--svm-kernel", default="RBF", choices=["LINEAR","POLY","RBF","SIGMOID"], help="SVM kernel type (default: RBF)")
     parser.add_argument("--lambda", type=float, default=0.1, dest="lambda_", help="Regularisation strength for ridge/linear reducers (default: 0.1)")
     parser.add_argument("--prefix", help="Prefix for output raster filenames (default: 'prediction_map')")
     parser.add_argument("--only-similarity", action="store_true", help="Only generate/download similarity map (skip masks)")
@@ -298,8 +296,6 @@ def main():
             params = {"numberOfTrees": args.n_trees}
         elif method == "gbt":
             params = {"numberOfTrees": args.n_trees}
-        elif method == "svm":
-            params = {"kernelType": args.svm_kernel}
         elif method in ("ridge", "linear", "robust_linear"):
             params = {"lambda_": args.lambda_}
 
